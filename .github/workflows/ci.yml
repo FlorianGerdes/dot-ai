@@ -20,21 +20,21 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         submodules: true
 
     - name: Setup Node.js
-      uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
       with:
-        node-version: '22.x'
+        node-version: '24.x'
         cache: 'npm'
 
     - name: Install dependencies
       run: npm ci
 
     - name: Install Devbox
-      uses: jetify-com/devbox-install-action@a0d2d53632934ae004f878c840055956d9f741b0 # v0.14.0
+      uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
       with:
         enable-cache: true
 
@@ -69,7 +69,7 @@ jobs:
 
     - name: Upload Docker images
       if: steps.secrets-check.outputs.available == 'true'
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: docker-images
         path: |
@@ -100,8 +100,12 @@ jobs:
             tests: version
           - name: remediate
             tests: remediate
+          # mcp-progress folds in here rather than getting its own job: apply_profile
+          # unions infra across the listed names, and its recommend calls need the
+          # CNPG CRDs the recommend profile installs. Sharing the cluster also avoids
+          # a second spin-up.
           - name: recommend
-            tests: recommend
+            tests: recommend mcp-progress
           - name: query
             tests: query
           - name: manage-org-data-policies-capabilities
@@ -111,29 +115,32 @@ jobs:
             tests: operate manage-org-data-patterns manage-knowledge auth rbac
           - name: base-group-2
             tests: resource-sync openapi plugin project-setup prompts
+          # Isolated in its own group because its migration seed step recreates and then deletes the legacy `patterns` collection.
+          - name: unified-knowledge-base
+            tests: unified-knowledge-base
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         submodules: true
 
     - name: Setup Node.js
-      uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
       with:
-        node-version: '22.x'
+        node-version: '24.x'
         cache: 'npm'
 
     - name: Install dependencies
       run: npm ci
 
     - name: Install Devbox
-      uses: jetify-com/devbox-install-action@a0d2d53632934ae004f878c840055956d9f741b0 # v0.14.0
+      uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
       with:
         enable-cache: true
 
     - name: Download Docker images
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
       with:
         name: docker-images
         path: /tmp
@@ -161,19 +168,19 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         submodules: true
 
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@45c373516f557556c15d420e3f5e0aa3d64366bc # v3
+      uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
       with:
         languages: typescript
 
     - name: Setup Node.js
-      uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
       with:
-        node-version: '22.x'
+        node-version: '24.x'
         cache: 'npm'
 
     - name: Install dependencies
@@ -186,4 +193,4 @@ jobs:
       run: npx --no-install better-npm-audit audit --level moderate
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@45c373516f557556c15d420e3f5e0aa3d64366bc # v3
+      uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4

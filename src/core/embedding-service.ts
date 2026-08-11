@@ -6,9 +6,11 @@
  */
 
 import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
+import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
 import { google } from '@ai-sdk/google';
 import { createOpenAI } from '@ai-sdk/openai';
-import { embed, EmbeddingModel } from 'ai';
+import { embed, embedMany, EmbeddingModel } from 'ai';
+import { getMaxRetries } from './ai-retry-config';
 import {
   CircuitBreaker,
   CircuitBreakerStats,
@@ -58,6 +60,7 @@ export interface EmbeddingProvider {
 interface EmbedOptions {
   model: EmbeddingModel;
   value: string;
+  maxRetries?: number;
   providerOptions?: {
     google?: {
       outputDimensionality: number;
@@ -111,7 +114,9 @@ export class VercelEmbeddingProvider implements EmbeddingProvider {
         this.dimensions = config.dimensions || 768;
         break;
       case 'amazon_bedrock':
-        // AWS SDK handles credentials automatically - no API key needed
+        // PRD #694: Credentials are resolved through the explicit
+        // credentialProvider (fromNodeProviderChain), not automatically.
+        // No static API key is needed for secretless EKS auth.
         this.apiKey = 'bedrock-uses-aws-credentials';
         this.model =
           config.model ||
@@ -144,12 +149,12 @@ export class VercelEmbeddingProvider implements EmbeddingProvider {
           this.modelInstance = google.textEmbedding(this.model);
           break;
         case 'amazon_bedrock': {
-          // AWS SDK automatically uses credential chain:
-          // 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)
-          // 2. ~/.aws/credentials file
-          // 3. IAM roles (EC2 instance profiles, ECS roles, EKS service accounts)
+          // PRD #694: Explicit credentialProvider enables secretless auth.
+          // fromNodeProviderChain() supports env vars, shared config, IRSA
+          // web-identity, EKS Pod Identity / container credentials, and IMDS.
           const bedrock = createAmazonBedrock({
             region: process.env.AWS_REGION || 'us-east-1',
+            credentialProvider: fromNodeProviderChain(),
           });
           this.modelInstance = bedrock.textEmbeddingModel(this.model);
           break;
@@ -184,6 +189,8 @@ export class VercelEmbeddingProvider implements EmbeddingProvider {
             const embedOptions: EmbedOptions = {
               model: this.modelInstance!,
               value: text.trim(),
+              // Configurable retry budget; embeddings default to higher resilience.
+              maxRetries: getMaxRetries('embeddings'),
             };
 
             // Add Google-specific options
@@ -251,28 +258,26 @@ export class VercelEmbeddingProvider implements EmbeddingProvider {
         try {
           // Execute through circuit breaker to prevent cascading failures
           return await embeddingCircuitBreaker.execute(async () => {
-            const results = await Promise.all(
-              validTexts.map(text => {
-                const embedOptions: EmbedOptions = {
-                  model: this.modelInstance!,
-                  value: text,
-                };
+            // Single batch request via SDK; handles chunking internally.
+            const embedManyOptions: Parameters<typeof embedMany>[0] = {
+              model: this.modelInstance!,
+              values: validTexts,
+              // Configurable retry budget; embeddings default to higher resilience.
+              maxRetries: getMaxRetries('embeddings'),
+            };
 
-                // Add Google-specific options
-                if (this.providerType === 'google') {
-                  embedOptions.providerOptions = {
-                    google: {
-                      outputDimensionality: this.dimensions,
-                      taskType: 'SEMANTIC_SIMILARITY',
-                    },
-                  };
-                }
+            // Apply Google-specific options once for the whole batch.
+            if (this.providerType === 'google') {
+              embedManyOptions.providerOptions = {
+                google: {
+                  outputDimensionality: this.dimensions,
+                  taskType: 'SEMANTIC_SIMILARITY',
+                },
+              };
+            }
 
-                return embed(embedOptions);
-              })
-            );
-
-            return results.map(result => result.embedding);
+            const result = await embedMany(embedManyOptions);
+            return result.embeddings;
           });
         } catch (error) {
           // Convert CircuitOpenError to descriptive message

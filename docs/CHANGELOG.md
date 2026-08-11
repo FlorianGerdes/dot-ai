@@ -7,6 +7,315 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- towncrier release notes start -->
 
+## [2.1.0] - 2026-08-09
+
+### Features
+
+- Long-running MCP tool calls (notably `recommend`) now emit `notifications/progress` for their whole duration, keeping the connection alive so a proxy/load-balancer idle timeout no longer drops an in-flight request. Progress is opt-in per call via `_meta.progressToken`; callers that do not send one — and all REST callers — are unaffected. A time-based heartbeat (default 20s, configurable with `mcp.progress.heartbeatIntervalMs`) guarantees liveness, and `recommend` layers semantic phase labels on top, which clients that surface progress messages will display. Claude Code needs no configuration: it registers a progress handler, so the token is sent automatically, and it resets its own idle timeout on every notification. Clients built directly on the MCP TypeScript SDK must additionally pass `resetTimeoutOnProgress` to extend their own request deadline. ([#705-mcp-progress-notifications](https://github.com/vfarcic/dot-ai/issues/705-mcp-progress-notifications))
+- ## Refreshed Pinned AI Model Versions Across Nine Providers
+
+  Nine provider pins have been upgraded to each provider's current model. The previous refresh was three months earlier, and every provider except Anthropic Haiku, Google Gemini Pro, and OpenRouter had shipped at least one newer model since.
+
+  - **Anthropic Sonnet**: `claude-sonnet-4-6` → `claude-sonnet-5`. Activated by default and when `AI_PROVIDER=anthropic`.
+  - **Anthropic Opus**: `claude-opus-4-7` → `claude-opus-5`. Activated when `AI_PROVIDER=anthropic_opus`.
+  - **OpenAI**: `gpt-5.4` → `gpt-5.6-terra`. Activated when `AI_PROVIDER=openai` or `AI_PROVIDER=custom`. Terra is the tier successor to the previous pin and is slightly cheaper ($2/$12 per million tokens versus $2.50/$15); `gpt-5.6-sol` is available as the flagship tier via `AI_MODEL` if you want to trade cost for capability.
+  - **Google Gemini Flash**: `gemini-3-flash-preview` → `gemini-3.6-flash`. Activated when `AI_PROVIDER=google_flash`. This also moves the pin off a preview model onto a GA one — Google shipped only Flash-Lite variants at the 3.1 generation, so the full-Flash tier was unavailable at the last refresh.
+  - **Moonshot Kimi**: `kimi-k2.5` → `kimi-k3`, with a 1M-token context window (up from 256K). Activated when `AI_PROVIDER=kimi`. This upgrade is time-critical: `kimi-k2.5` is already unavailable to newly registered Moonshot accounts and is sunset on 2026-08-31, so the old pin stops working regardless of upgrading.
+  - **Alibaba Qwen**: `qwen3.6-plus` → `qwen3.7-plus`, adding image understanding alongside text. Activated when `AI_PROVIDER=alibaba`.
+  - **xAI Grok**: `grok-4` → `grok-4.5`, with a 500K-token context window and text and image input. Activated when `AI_PROVIDER=xai`.
+  - **Amazon Bedrock**: `global.anthropic.claude-sonnet-4-6` → `global.anthropic.claude-sonnet-5`. Activated when `AI_PROVIDER=amazon_bedrock`.
+  - **GitHub Copilot**: `claude-sonnet-4.6` → `claude-sonnet-5`. Activated when `AI_PROVIDER=copilot`.
+
+  Three pins were evaluated and deliberately left alone because they are already current: Anthropic Haiku (`claude-haiku-4-5-20251001` — no Haiku 5 generation exists), Google Gemini Pro (`gemini-3.1-pro-preview` — still the flagship Gemini and still preview-only), and OpenRouter (`anthropic/claude-haiku-4.5`). Both embedding models are also unchanged and current: OpenAI's `text-embedding-3-small` has no announced successor, and Google's `gemini-embedding-001` remains the GA option.
+
+  No configuration changes are required for most users — the same provider API key environment variables continue to work, and `AI_MODEL` still overrides the pin for any provider. Two provider-side conditions are worth checking before upgrading: Amazon Bedrock users need Claude Sonnet 5 enabled for their AWS account, and GitHub Copilot's Claude Sonnet 5 requires a Copilot Pro, Pro+, Max, Business, or Enterprise plan. In either case, setting `AI_MODEL` to the previously pinned model restores the old behavior.
+
+  ([#742](https://github.com/vfarcic/dot-ai/issues/742))
+
+### Bug Fixes
+
+- Fixed remediation actions failing when a fix targets a field nested inside a container. The AI could choose `kubectl patch --type=merge` for changes like a memory limit, but a JSON merge patch replaces the `containers` array instead of merging into it, dropping the container's `image` and causing the API server to reject the command with `spec.template.spec.containers[0].image: Required value`. The remediation guidance now selects the patch type from the shape of the intended merge-patch object — anything containing an array uses `--type=json` — and additionally requires resolving the target container's index by name rather than assuming the first one, and choosing `add` over `replace` when the field being set does not exist yet. ([#736-remediate-merge-patch-arrays](https://github.com/vfarcic/dot-ai/issues/736-remediate-merge-patch-arrays))
+
+
+## [2.0.0] - 2026-08-06
+
+### Breaking Changes
+
+- **The Server's Git Credential No Longer Follows a Caller-Supplied URL**
+
+  **Breaking change.** `pushToGit`, the per-request prompts override (`?repo=`), and `remediate`'s
+  repository clone all act on a URL that comes from — or is influenced by — the caller, and the server
+  attached its own `DOT_AI_GIT_TOKEN` (or a freshly minted GitHub App installation token) to whatever URL
+  it was handed. It no longer does. The credential now travels only to a repository whose URL is
+  `https://` and whose host appears in the new `gitops.allowedRepoHosts` Helm value, which defaults to
+  `["github.com", "www.github.com"]`. Both conditions, not either.
+
+  The consequence differs per caller, deliberately. `pushToGit` **refuses** the request — direct push and
+  pull request mode alike — before any credential is minted, cloned with, or pushed with. The prompts
+  override and remediate **degrade instead of refusing**: the clone still happens, just unauthenticated,
+  so every public repository on every host keeps working and only a *private* one loses access. The
+  prompts override explains itself when it fails — the error names which half refused it, host or scheme,
+  and gives the remedy for that half — but a gated cache *refresh* does not fail at all, it keeps serving
+  the cached copy, so watch the server log for `Withholding the server git credential from this pull`.
+
+  For the prompts override, two different URLs reach that degradation, and the remedy is not the same for
+  both. An `https://` URL whose **host** is not on the allowlist is the ordinary case: add the host to
+  `gitops.allowedRepoHosts`, or send the request's own credential in the `X-Dot-AI-Git-Token` header,
+  which still bypasses the allowlist for this caller. An `http://` URL degrades too — on **any** host,
+  listed or not — because it is the *scheme* that refused it, and the message says so rather than blaming
+  the allowlist: no chart value fixes an `http://` URL, so send the repository's `https://` clone URL
+  instead, and do not reach for `X-Dot-AI-Git-Token` here, since it would put your own token on a
+  cleartext request. Those two schemes are the only ones that get as far as the credential decision:
+  `ssh://`, `git://` and `file://` have always been rejected with `HTTP 400` by input validation and
+  still are.
+
+  Separately, and new in this release, the prompts override now **refuses a non-public destination
+  outright** — `HTTP 400`, before anything is fetched — when the `?repo=` host is an IP literal in a range
+  that is never a public prompts source: loopback, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+  link-local `169.254.0.0/16` (the cloud metadata endpoint), `0.0.0.0/8`, `255.255.255.255`, and on IPv6
+  `::1`, `::`, `fe80::/10`, `fc00::/7` plus IPv4-mapped forms. Alternate spellings do not slip past it
+  (decimal, hex, octal, `127.1`, a bare `0`, a trailing dot, a port, userinfo), and an
+  `X-Dot-AI-Git-Token` does not soften it — this decides whether the fetch happens at all, not whose
+  credential travels. The check classifies **literals only and performs no DNS**, so a hostname that
+  resolves to an internal address still reaches the clone: keep an upstream gate in front of the endpoint
+  if untrusted clients can reach it. Requests using `?repo=` against an internal IP address stop working
+  on upgrade; `DOT_AI_USER_PROMPTS_REPO` is unaffected, so an operator-configured in-cluster prompts
+  repository on a private address keeps working exactly as before.
+
+  Deployments that only ever use `https://` github.com URLs are unaffected by the default, in either the
+  bare `github.com` or the `www.github.com` form — the default lists both, as two separate literal
+  entries, because the allowlist has no wildcard or subdomain matching and neither host covers the other.
+  Everyone else adds their hosts explicitly, for example
+  `--set-json 'gitops.allowedRepoHosts=["github.com","www.github.com","gitlab.example.com"]'` — setting
+  the value replaces the default outright, so re-list the entries you still want. Note the asymmetry: an
+  unset value falls back to `["github.com", "www.github.com"]`, while an empty list — or `gitops: null` —
+  is read as an explicit deny-all, never as "not configured". And `DOT_AI_GIT_TOKEN` is not a
+  GitHub-only credential: the server sends it as the HTTP basic-auth password under `x-access-token`,
+  which is how GitLab and Gitea/Forgejo accept a PAT, so a token for one of those hosts did authenticate
+  before this release.
+
+  See the [GitOps Repository Host Allowlist](https://devopstoolkit.ai/docs/mcp/ai-engine/setup/deployment#gitops-repository-host-allowlist)
+  for matching rules and the unset-vs-empty semantics,
+  [Shared Prompt Library](https://devopstoolkit.ai/docs/mcp/ai-engine/tools/prompts#the-server-credential-and-the-host-allowlist)
+  for the prompts-override walkthrough and what the override fetch still exposes, and
+  [Authorization](https://devopstoolkit.ai/docs/mcp/ai-engine/setup/authorization) for the upgrade path. ([#710-git-credential-host-allowlist](https://github.com/vfarcic/dot-ai/issues/710-git-credential-host-allowlist))
+- **Breaking change.** Direct push to Git via `pushToGit` now requires the `apply` verb on `recommend`; pull request mode needs only `execute`. Any deployment with `rbac.enforcement.enabled: true` whose users push directly with a viewer-level (`execute`-only) binding stops working on upgrade. The obvious remedy — granting `apply` — also unblocks `deployManifests`, which is usually the opposite of what such an operator wants. The intended migration is to adopt PR mode, not to widen the binding. Exposure is bounded because `rbac.enforcement.enabled` defaults to `false`. See the [authorization upgrade section](https://devopstoolkit.ai/docs/mcp/ai-engine/setup/authorization) for the full guidance.
+
+  Two more path-safety behavior changes ship alongside this:
+
+  - `pushToGit` refuses a `targetPath` that traverses, or itself is, a symbolic link in the GitOps repository.
+  - `pushToGit` and `remediate` now refuse to write any path that resolves inside the git control directory (`.git`), including through a symlink committed in the repository; the whole batch of files is validated before any of it is written.
+
+  ([#710-pushtogit-apply-verb-and-path-guards](https://github.com/vfarcic/dot-ai/issues/710-pushtogit-apply-verb-and-path-guards))
+
+
+## [1.25.0] - 2026-07-22
+
+### Features
+
+- **Secretless Amazon Bedrock Authentication**
+
+  Amazon Bedrock now authenticates through the standard AWS credential provider chain, so dot-ai can run on EKS with no static AWS access keys. Previously the Bedrock provider only read `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` directly from the environment, forcing operators to inject long-lived keys and rotate them manually — secretless mechanisms like EKS Pod Identity and IRSA simply did not work.
+
+  Both the LLM and the Bedrock (Titan) embeddings paths now resolve credentials via `fromNodeProviderChain()`, which walks environment variables, shared AWS config/credentials files, IRSA web-identity tokens, EKS Pod Identity / container credentials, and EC2 instance metadata (IMDS). Short-lived IRSA and Pod Identity credentials are refreshed automatically on each request, so multi-hour sessions keep working without pod restarts. Existing setups are unaffected: static environment-variable keys are still checked first, and bearer-token auth (`AWS_BEARER_TOKEN_BEDROCK`) continues to take precedence.
+
+  Set `AI_PROVIDER=amazon_bedrock` and provide a region via `AWS_REGION` (defaults to `us-east-1`). On EKS, associate an IAM role with the pod's ServiceAccount through Pod Identity or IRSA — no static credentials required. ([#694](https://github.com/vfarcic/dot-ai/issues/694))
+
+
+## [1.24.0] - 2026-07-14
+
+### Features
+
+- Organizational patterns and policies are now consolidated into a single unified knowledge base — one `knowledge` collection whose documents carry AI-assigned classification tags — replacing the separate pattern and policy vector collections. Documents are ingested, searched, and removed through the `manageKnowledge` tool, and all consumers (deployment recommendations, the operate tool, and the REST API) read from the one collection. Existing `patterns`/`policies` collections are migrated into the unified knowledge base automatically on server startup (idempotent, non-fatal, with deterministic IDs so re-runs cannot duplicate points), so upgrades need no manual data steps. The optional in-cluster local embedding service can also prefetch its model via an init container (`localEmbeddings.prefetch`) to work around HuggingFace Xet-storage download failures.
+
+  Note: as part of this change, `manageOrgData` is now capabilities-only — organizational patterns and policies are managed through `manageKnowledge` (ingest / search / deleteByUri) with automatic AI classification. The `pattern` and `policy` `dataType` values and the `create`/`analyze` operations have been removed from `manageOrgData`; calls using them now return a validation error pointing to `manageKnowledge`. ([#375-unified-knowledge-base](https://github.com/vfarcic/dot-ai/issues/375-unified-knowledge-base))
+
+### Bug Fixes
+
+- Ingesting a prompts source no longer intermittently fails with `EXDEV: cross-device link not permitted` when the staging and destination cache directories resolve to different filesystems. The cache root is now resolved once per ingest so the staging directory and its final location always share a filesystem, and the writability probe uses a unique filename to avoid a race between concurrent ingests. ([#647-prompts-ingest-cross-device](https://github.com/vfarcic/dot-ai/issues/647-prompts-ingest-cross-device))
+
+
+## [1.23.1] - 2026-07-07
+
+### Bug Fixes
+
+- Generating skills from the `prd-full` prompt now produces a complete `SKILL.md` with its full instruction body. Previously its `prdNumber` and `mode` arguments were marked `required: true`, so static skill generation (which calls `prompts/get` with no arguments) failed with `400 Missing required arguments` and wrote a metadata-only, body-less skill. Both arguments are now `required: false` — the prompt body still enforces them at invocation time — matching sibling prompts like `prd-start`. ([#681-prd-full-skill-body](https://github.com/vfarcic/dot-ai/issues/681-prd-full-skill-body))
+
+
+## [1.23.0] - 2026-06-20
+
+### Features
+
+- Added server-side ingestion endpoint (`POST /api/v1/prompts/sources`) that accepts CLI-uploaded skill sources as a JSON manifest with base64-encoded file entries, stores them in an LRU cache with deduplication (M4), and serves them via `?source=<key>` on the existing prompt-render endpoint without requiring a Git clone. Includes D5 hardening: 512 KiB raw-body limit (413), zip-slip and null-byte path rejection (400), mode stripping, and atomic re-ingest. M5 secret scrubbing and `?repo=` render parity are also included, along with mock-server parity and documentation. Also added `GET /api/v1/prompts?source=<id>` to enumerate the prompts contained in an uploaded source (standard list schema, scrubbed identifier echo); an unknown or evicted source returns 400 with re-upload guidance and never triggers a clone. ([#647-prompts-source-ingestion-endpoint](https://github.com/vfarcic/dot-ai/issues/647-prompts-source-ingestion-endpoint))
+
+### Bug Fixes
+
+- A per-request prompts-repo override (`?repo=` / `body.repo`) whose source cannot be cloned — for example a missing or wrong forwarded `X-Dot-AI-Git-Token`, or an unreachable host — now fails with HTTP 502 (`PROMPTS_SOURCE_ERROR`) instead of silently falling back to built-in prompts with HTTP 200. The CLI surfaces this as an error rather than reporting success with fewer skills. Failures of the env-var-configured repo (`DOT_AI_USER_PROMPTS_REPO`) still fall back to built-in prompts as before, and the returned error message remains credential-scrubbed. ([#575-prompts-override-fail-open](https://github.com/vfarcic/dot-ai/issues/575-prompts-override-fail-open))
+
+### Other Changes
+
+- Updated dependencies to clear known security advisories. Bumped `@opentelemetry/sdk-node` and `@opentelemetry/exporter-trace-otlp-http` to `0.219.0` (resolving the `@opentelemetry/core` and `protobufjs` advisories) and refreshed transitive packages (`form-data`, `hono`, `ws`, `vite`, `dompurify`, `js-yaml`) to patched versions. `npm audit` now reports no moderate-or-higher vulnerabilities. ([#648-dependency-security-updates](https://github.com/vfarcic/dot-ai/issues/648-dependency-security-updates))
+- Pinned the transitive `dompurify` dependency to `^3.4.11` via an `overrides` entry to clear the moderate advisory GHSA-cmwh-pvxp-8882 (permanent `ALLOWED_ATTR` pollution via `setConfig()` bypassing the hook clone-guard; incomplete fix of the 3.4.7 patch). `npm audit` now reports no moderate-or-higher vulnerabilities. ([#655-dompurify-security](https://github.com/vfarcic/dot-ai/issues/655-dompurify-security))
+- Pinned the transitive `undici` dependency to `^6.27.0` via an `overrides` entry to clear four newly-disclosed advisories: GHSA-p88m-4jfj-68fv (moderate, HTTP header injection via Set-Cookie percent-decoding), GHSA-vxpw-j846-p89q (high, WebSocket client DoS via fragment count bypass), GHSA-35p6-xmwp-9g52 (low, HTTP response queue poisoning via keep-alive socket reuse), and GHSA-g8m3-5g58-fq7m (low, Set-Cookie SameSite downgrade). `npm audit` now reports no moderate-or-higher vulnerabilities. ([#655-undici-security](https://github.com/vfarcic/dot-ai/issues/655-undici-security))
+
+
+## [1.22.0] - 2026-06-13
+
+### Features
+
+- **Per-Request Path, Branch, and Credential for the Prompts Repo Override**
+
+  The per-request prompts-repo override now carries a subdirectory, a branch, and a credential, so a secondary skills source no longer has to live at the repository root on `main` behind the server's single git token. Previously the override (`?repo=`) cloned only the repository root of the default branch using the server's `DOT_AI_GIT_TOKEN`, which left repositories that keep skills under a `skills/`-style subdirectory, on a non-default branch, or in a different authentication realm unusable as a source.
+
+  `GET /api/v1/prompts` and `POST /api/v1/prompts/:name` now accept `?path=` and `?branch=` query parameters, and `POST /api/v1/prompts/refresh` accepts `path` and `branch` body fields, so the override can target a subdirectory on any branch. A new `X-Dot-AI-Git-Token` request header authenticates the override clone against its own host and takes precedence over the server's `DOT_AI_GIT_TOKEN` for that request only — letting you pull from a private repository in a separate auth realm without reconfiguring the server. The forwarded token is scoped to the source host (never forwarded across a redirect), never written to logs, error messages, the `source` field, or the cache key, and token-bearing requests are cloned in isolation so a private source is never served from or into the shared cache.
+
+  All three additions are optional and additive: omit `path` for the repository root, omit `branch` for `main`, and omit the header to use the server's environment credential. A request that sends none of them behaves identically to before, so existing deployments see no change.
+
+  See the [Prompts REST API reference](https://devopstoolkit.ai/docs/mcp/ai-engine/api/rest-api) and the [multi-source skills override guide](https://devopstoolkit.ai/docs/mcp/ai-engine/tools/prompts) for parameters, defaults, and precedence. ([#621](https://github.com/vfarcic/dot-ai/issues/621))
+
+
+## [1.21.1] - 2026-06-12
+
+### Bug Fixes
+
+- The operate tool now extracts JSON from AI responses using a more robust parser, fixing intermittent `Operation failed: Invalid AI response format` errors that occurred when the model included explanatory text alongside the JSON object. ([#operate-json-parse](https://github.com/vfarcic/dot-ai/issues/operate-json-parse))
+- GitHub Copilot provider configuration now rejects personal access tokens (`github_pat_*` and `ghp_*`) before making inference calls, because `api.githubcopilot.com` does not support PATs for this direct-token endpoint. Docs and Helm comments now list only `gho_*` and `ghu_*` tokens. ([#627-fix-copilot-pat-support](https://github.com/vfarcic/dot-ai/issues/627-fix-copilot-pat-support))
+
+
+## [1.21.0] - 2026-06-06
+
+### Features
+
+- **Per-Request User Prompts Repository Override**
+
+  The three prompts REST endpoints now accept an optional `repo` parameter that overrides `DOT_AI_USER_PROMPTS_REPO` for a single request, letting CLI consumers compose skills from multiple repositories without standing up multiple servers or aggregating into a single repo. Requests without `repo` behave identically to before — fully additive.
+
+  `POST /api/v1/prompts/refresh` accepts `repo` in the JSON body; `GET /api/v1/prompts` and `POST /api/v1/prompts/:promptName` accept `?repo=<url>` as a query parameter. Every response now includes a `source` field that echoes the override URL (or the env-var-configured repo, or `"built-in"`), with embedded credentials scrubbed via `sanitizeUrlForLogging`. The value is stable across requests for the same repo so CLI consumers can use it as a per-source tag in skill frontmatter and wipe only their own slice on subsequent invocations. Invalid `repo` values (non-`http(s)` schemes, path traversal in `subPath`, invalid branches, non-string types) return `400 VALIDATION_ERROR` without disturbing the env-var-configured cache.
+
+  MVP scope notes: the existing `DOT_AI_GIT_TOKEN` is reused for all override URLs (per-repo tokens deferred), and the loader keeps a single-slot cache (sequential requests across different repos re-clone — per-repo cache map deferred). Per-request `branch` and `path` defaults match the env-var defaults (`main` and repo root) and can be exposed additively later. MCP `prompts/list` and `prompts/get` are unchanged — composition is CLI-driven.
+
+  See the [REST API reference](https://devopstoolkit.ai/docs/mcp/api/rest-api) for full request/response shapes, validation rules, and credential-scrubbing examples, and the [Prompts tool guide](https://devopstoolkit.ai/docs/mcp/tools/prompts) for the multi-source composition workflow. ([#581](https://github.com/vfarcic/dot-ai/issues/581))
+
+
+## [1.20.0] - 2026-05-27
+
+### Features
+
+- **GitHub Copilot Provider**
+
+  Use an existing GitHub Copilot subscription as the AI backend instead of paying for a separate per-token API (Anthropic, OpenAI, etc.). Previously, the only subscription-based option was the `host` provider, which required a compatible MCP client to delegate generation; the new `copilot` provider works standalone with just a token.
+
+  Set `AI_PROVIDER=copilot` and supply a long-lived GitHub token via `GITHUB_COPILOT_TOKEN`. Supported token prefixes are `gho_` (OAuth, from `gh auth token`) and `ghu_` (GitHub App). Personal access tokens (`github_pat_` fine-grained PATs and classic `ghp_` PATs) are not supported by `api.githubcopilot.com`. The resolver also checks `GH_TOKEN` and `GITHUB_TOKEN` as fallbacks. The provider sends the token directly to the Copilot API with VS Code-style headers and retries once on 401. Default model is `claude-sonnet-4-6`, overridable via `AI_MODEL`.
+
+  Helm support is included: `--set ai.provider=copilot --set secrets.copilot.token=$GITHUB_COPILOT_TOKEN`. Note that this is an unofficial integration that sends requests to `api.githubcopilot.com` with VS Code-style headers, mirroring the approach used by other third-party tools. It may break without notice if GitHub changes the API, and operators should review Copilot terms for their subscription tier before deploying.
+
+  See the [Deployment Guide](https://devopstoolkit.ai/docs/mcp/ai-engine/setup/deployment) for the full Helm command and the unofficial-integration notice. ([#587](https://github.com/vfarcic/dot-ai/issues/587))
+
+### Other Changes
+
+- Followup to PR #572 (issue #464): add `MockLanguageModelV3`-based unit tests covering `VercelProvider.toolLoop`. Verifies the multi-step tool-call flow end to end: a single `tool-call` content part dispatches the executor with parsed input, two sequential tool calls produce ordered `toolCallsExecuted` entries with matching iteration counts, and an unknown tool name leaves the executor untouched while the loop still returns the final text. No production code changes. ([#464-vercel-provider-toolloop-tests](https://github.com/vfarcic/dot-ai/issues/464-vercel-provider-toolloop-tests))
+
+
+## [1.19.1] - 2026-05-13
+
+### Other Changes
+
+- Followup to PR #493 (issue #464): add `MockLanguageModelV3`-based unit tests covering `VercelProvider.sendMessage` error paths. Verifies that rate-limit (429), auth (401), and generic network failures from the Vercel AI SDK are wrapped into a single `<provider> API error:` `Error` with the original error preserved on `cause`, so upstream telemetry, retry classification, and debug logs can still inspect the underlying failure. No production code changes. ([#464-vercel-provider-error-paths](https://github.com/vfarcic/dot-ai/issues/464-vercel-provider-error-paths))
+
+
+## [1.19.0] - 2026-05-12
+
+### Features
+
+- Configurable retry budget for AI SDK calls. `embed`, `embedMany`, and `generateText` now pass an explicit `maxRetries` value resolved per operation type (`embeddings`, `chat`, `tool_loop`, `wrap_up`). Defaults match production needs (embeddings 4 for resilience, chat 2, tool-loop 2, wrap-up 1) and can be tuned via typed Helm values under `ai.retries.{default,embeddings,chat,toolLoop,wrapUp}`, which the chart templates into the underlying env vars (`DOT_AI_AI_MAX_RETRIES`, `DOT_AI_AI_MAX_RETRIES_EMBEDDINGS`, `DOT_AI_AI_MAX_RETRIES_CHAT`, `DOT_AI_AI_MAX_RETRIES_TOOL_LOOP`, `DOT_AI_AI_MAX_RETRIES_WRAP_UP`). Per-operation values take precedence over the global override; setting a value to `0` disables retries. ([#459-configure-retry-behavior](https://github.com/vfarcic/dot-ai/issues/459-configure-retry-behavior))
+
+### Bug Fixes
+
+- Upgrade `@opentelemetry/sdk-node` and `@opentelemetry/exporter-trace-otlp-http` from `^0.207.0` to `^0.217.0` to close GHSA-q7rr-3cgh-j5r3 (high severity, Prometheus exporter process crash via malformed HTTP request). Upgrade `mermaid` from `^10.9.5` to `^11.15.0` to close GHSA-87f9-hvmw-gh4p, GHSA-6m6c-36f7-fhxh, GHSA-ghcm-xqfw-q4vr, and GHSA-xcj9-5m2h-648r (4 moderate severity, CSS/HTML injection and infinite-loop DoS in Mermaid diagrams). All transitively-bumped `@opentelemetry/*` packages move in lockstep to `0.217.0` / `2.7.1`. The codebase only consumes `mermaid.parse()` and `mermaid.initialize()`, whose APIs are unchanged between v10 and v11. Unblocks `npm run audit` and the CI `Run dependency security audit` gate. ([#otel-prometheus-security-advisory](https://github.com/vfarcic/dot-ai/issues/otel-prometheus-security-advisory))
+- Upgrade base images and `@types/node` from Node.js 22 to 24 (`Dockerfile`, `mock-server/Dockerfile`, `packages/agentic-tools/Dockerfile`, plus `node-version: '24.x'` in all GitHub Actions workflows so CI and prod images stay in lockstep). Upgrade `vitest` and `@vitest/ui` from `^3.2.4` to `^4.0.0`. Add a `protobufjs: ^8.2.0` override to close 7 transitive security advisories pulled in via `@opentelemetry/otlp-transformer` and `@grpc/proto-loader`: GHSA-q6x5-8v7m-xcrf (moderate, overlong UTF-8 decoding), GHSA-2pr8-phx7-x9h3 (moderate, DoS from crafted field names), GHSA-66ff-xgx4-vchm (high, code injection through bytes field defaults), GHSA-fx83-v9x8-x52w (moderate, prototype injection in generated constructors), GHSA-75px-5xx7-5xc7 (high, code generation gadget after prototype pollution), GHSA-jvwf-75h9-cwgg (high, process-wide DoS through unsafe option paths), GHSA-685m-2w69-288q (high, DoS through unbounded protobuf recursion). Removes pre-existing SHA digest pins from `mock-server/Dockerfile` and `packages/agentic-tools/Dockerfile`, consistent with the multi-arch policy enforced in `renovate.json`. Unblocks the CI `Run dependency security audit` gate on `main`. ([#565-node24-vitest4-protobufjs](https://github.com/vfarcic/dot-ai/issues/565-node24-vitest4-protobufjs))
+
+
+## [1.18.1] - 2026-05-10
+
+### Bug Fixes
+
+- Override transitive `fast-uri` to `>= 3.1.2` to close two high-severity security advisories surfaced by the dependency audit step in CI: `GHSA-q3j6-qgpj-74h6` (path traversal via percent-encoded dot segments, fixed in `>= 3.1.1`) and `GHSA-v39h-62p7-jpjc` (host confusion via percent-encoded authority delimiters, fixed in `>= 3.1.2`). The vulnerable version was pulled in via `@modelcontextprotocol/sdk@1.27.1 -> ajv@8.18.0 -> fast-uri@3.1.0`. ([#495-fast-uri-security-advisory](https://github.com/vfarcic/dot-ai/issues/495-fast-uri-security-advisory))
+
+### Other Changes
+
+- **Mock-model unit tests for the Vercel AI provider**
+
+  Adds a `MockLanguageModelV3`-based test helper and the first happy-path
+  unit tests for `VercelProvider.sendMessage`. Provider response mapping and
+  prompt forwarding can now be exercised without API keys, network calls,
+  or live integration fixtures, complementing the existing per-provider
+  integration suite. ([#464-mock-language-model-unit-tests](https://github.com/vfarcic/dot-ai/issues/464-mock-language-model-unit-tests))
+- Replace manual `Promise.all + embed()` fan-out in `VercelEmbeddingProvider.generateEmbeddings` with a single `embedMany` call from the Vercel AI SDK. The SDK now handles batching, parallelism, and chunking internally; existing OpenTelemetry tracing, circuit breaker, and Google `providerOptions` (outputDimensionality, taskType) are preserved. Adds `MockEmbeddingModelV3`-based unit tests covering the batching path. (#453) ([#453-use-embedmany-batch-embeddings](https://github.com/vfarcic/dot-ai/issues/453-use-embedmany-batch-embeddings))
+
+
+## [1.18.0] - 2026-05-08
+
+### Features
+
+- **New `/prd-full` Prompt — Autonomous PRD Execution Through PR**
+
+  A new shared prompt, `/prd-full`, runs an entire PRD lifecycle without prompting for confirmation between steps and stops once a pull request has been created. Composes the existing `/prd-start`, `/prd-next`, `/prd-update-progress`, and `/prd-done` prompts with a global "do not pause" rule and a hard stop after PR creation, so the user can review the result before merging.
+
+  Required arguments: `prdNumber` (the PRD to implement) and `mode` (`branch` or `worktree`, pre-answering the isolation choice that `/prd-start` would otherwise ask). ([#prd-full-prompt](https://github.com/vfarcic/dot-ai/issues/prd-full-prompt))
+
+
+## [1.17.0] - 2026-05-08
+
+### Features
+
+- **Refreshed Pinned AI Model Versions**
+
+  Two provider pins have been upgraded to their latest stable versions:
+
+  - **Anthropic Opus**: `claude-opus-4-6` → `claude-opus-4-7` (released April 16, 2026). Activated when `AI_PROVIDER=anthropic_opus`.
+  - **Alibaba Qwen**: `qwen3.5-plus` → `qwen3.6-plus`. Activated when `AI_PROVIDER=alibaba`.
+
+  No configuration changes are required — the same `ANTHROPIC_API_KEY` and `ALIBABA_API_KEY` environment variables continue to work. Users can override the model with `AI_MODEL` if needed.
+
+  The remaining provider pins (`openai`, `custom`, `google`, `google_flash`, `kimi`, `xai`) were evaluated against newer candidate versions but held at their current pins after baseline-vs-new integration testing. See PRD #480 for per-provider rationale and follow-up items. Stale model references in `docs/ai-engine/setup/deployment.md` (OpenRouter example), `src/core/ai-provider.interface.ts` (JSDoc examples), and `src/core/tracing/ai-tracing.ts` (comment examples) have also been refreshed to current pins.
+
+  ([#480-refresh-ai-model-pins](https://github.com/vfarcic/dot-ai/issues/480-refresh-ai-model-pins))
+
+
+## [1.16.3] - 2026-04-29
+
+### Bug Fixes
+
+- **Answer validator now accepts empty string when it's an explicit `select` option**
+
+  When the recommend tool generated a required `select` question whose `options` list explicitly included `""` (e.g., `["", "soft", "hard"]` to mean "no anti-affinity"), the answer validator rejected the empty string with a "required" error even though the question itself listed it as a valid choice. The validator now treats `""` as a valid answer for required `select` questions whenever it appears in the question's `options` array. ([#474-answer-validator-empty-select](https://github.com/vfarcic/dot-ai/issues/474-answer-validator-empty-select))
+- **Custom AI provider base URL now works through the Helm chart (#474)**
+
+  Two fixes so a custom OpenAI-compatible LLM endpoint can be configured end-to-end via Helm:
+
+  - `AI_PROVIDER=custom` is now a first-class provider — `PROVIDER_ENV_KEYS` maps it to `CUSTOM_LLM_API_KEY`, so the MCP server no longer falls back to `NoOpProvider` when `ai.provider: custom` is set.
+  - The Helm chart now omits the `AI_PROVIDER` env var when `ai.provider` is empty, restoring the auto-detect path that selects the `custom` provider whenever `customEndpoint.enabled: true` is configured.
+
+  The default (`ai.provider: anthropic`) is unchanged. Users with a custom endpoint can pick whichever style they prefer: explicit (`ai.provider: custom`) or auto-detect (`ai.provider: ""`).
+
+  ([#474-custom-provider-helm](https://github.com/vfarcic/dot-ai/issues/474-custom-provider-helm))
+
+### Other Changes
+
+- **Integration tests now create draft PRs to skip automated reviews**
+
+  The remediate tool's GitOps test path creates real PRs against `vfarcic/dot-ai` to verify the end-to-end flow. These transient PRs were briefly triggering CodeRabbit reviews. The PR creation in `handleGitCreatePr` now honors a `DOT_AI_GIT_CREATE_DRAFT_PRS=true` env var (set only on the integration test pod) to create those PRs as drafts, which CodeRabbit skips by configuration. Production behavior is unchanged. ([#474-integration-draft-prs](https://github.com/vfarcic/dot-ai/issues/474-integration-draft-prs))
+
+
+## [1.16.2] - 2026-04-26
+
+### Bug Fixes
+
+- **Resolve npm audit advisories (#468)**
+
+  Updated transitive dependencies via `npm audit fix` (hono, dompurify, lodash-es, postcss, protobufjs, vite, and others) and bumped direct `uuid` from 13 to 14 to address GHSA-w5hq-g745-h8pq. Added an `.nsprc` exception for the same advisory via the `mermaid > uuid` transitive path, which has no upstream fix yet; the vulnerable code path (passing a `buf` argument to `uuidv5`) is not used in this codebase. ([#468-npm-audit-fixes](https://github.com/vfarcic/dot-ai/issues/468-npm-audit-fixes))
+
+
 ## [1.16.1] - 2026-04-14
 
 No significant changes.
@@ -16,7 +325,7 @@ No significant changes.
 
 ### Features
 
-- ## Client-Driven OAuth Token Expiry
+- **Client-Driven OAuth Token Expiry**
 
   OAuth access tokens now support client-configurable expiry times, reducing authentication friction while maintaining security. Previously, all OAuth tokens expired after 1 hour, forcing users to re-authenticate multiple times per day.
 
@@ -29,7 +338,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Anthropic Bearer Auth for Corporate Proxies
+- **Anthropic Bearer Auth for Corporate Proxies**
 
   Corporate proxies fronting the Anthropic API that require `Authorization: Bearer` authentication now work correctly. Previously, the Anthropic SDK always sent credentials via the `x-api-key` header, causing `Unauthorized` errors when the proxy expected Bearer auth.
 
@@ -49,7 +358,7 @@ No significant changes.
 
 ### Features
 
-- ### MCP Client Outbound Authentication
+- **MCP Client Outbound Authentication**
 
   MCP server connections now support authentication via three mechanisms:
 
@@ -68,7 +377,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## AI provider errors no longer masked by JSON parse failures
+- **AI provider errors no longer masked by JSON parse failures**
 
   When an AI provider call fails (e.g., proxy authentication error, network timeout), the actual error message is now surfaced to the user. Previously, the error string was passed directly to `JSON.parse()`, producing a confusing `SyntaxError: Unexpected token 'E', "Error duri"... is not valid JSON` that hid the real cause. This affected the query, remediate, impact-analysis tools, and the REST API visualization endpoint. ([#fix-status-guard](https://github.com/vfarcic/dot-ai/issues/fix-status-guard))
 
@@ -77,14 +386,14 @@ No significant changes.
 
 ### Features
 
-- ## Session List API and SSE Streaming for Remediation Events
+- **Session List API and SSE Streaming for Remediation Events**
 
   External consumers such as TUI dashboards and controllers can now discover and monitor remediation sessions in real-time without knowing session IDs upfront.
 
   The new `GET /api/v1/sessions` endpoint lists remediation sessions with status filtering (`?status=analysis_complete`) and pagination (`?limit=10&offset=0`). Responses contain summary metadata only (sessionId, status, issue, mode, timestamps) to keep payloads lean. The new `GET /api/v1/events/remediations` endpoint provides a Server-Sent Events (SSE) stream that delivers `session-created` and `session-updated` events as remediations progress through their lifecycle — from investigation through analysis completion or execution. A 30-second heartbeat keeps connections alive through proxies, and client disconnections are handled with proper listener cleanup.
 
   The underlying session event bus is generic and tool-agnostic, using a `SessionEventBus` interface with an in-memory implementation. Each event carries a `toolName` field, so other tools (query, recommend, operate) can adopt real-time streaming with zero infrastructure changes. ([#425](https://github.com/vfarcic/dot-ai/issues/425))
-- ## Custom Headers and Base URL Support for All AI Providers
+- **Custom Headers and Base URL Support for All AI Providers**
 
   Enterprise users accessing AI providers through custom gateways or proxy deployments can now pass arbitrary HTTP headers and use custom base URLs without losing provider-specific features.
 
@@ -99,7 +408,7 @@ No significant changes.
 
 ### Features
 
-- ## GitOps Remediation via Pull Requests
+- **GitOps Remediation via Pull Requests**
 
   The remediate tool now automatically creates GitHub pull requests for GitOps-managed resources instead of running kubectl commands directly. When investigation detects that a resource is managed by Argo CD or Flux, confirming execution creates a PR with the corrected manifests — no additional user choice needed.
 
@@ -114,7 +423,7 @@ No significant changes.
 
 ### Features
 
-- ## MCP Server Integration
+- **MCP Server Integration**
 
   Connect dot-ai to external MCP servers running in the cluster, extending remediate, operate, and query tools with capabilities from the MCP ecosystem. Previously, these tools relied solely on kubectl-based investigation, limiting diagnostics for issues requiring historical metrics, performance data, distributed traces, or alert history.
 
@@ -123,12 +432,12 @@ No significant changes.
   Configure MCP servers in the Helm `mcpServers` section with an endpoint and `attachTo` list. dot-ai connects to configured servers at startup and fails fast with a clear error if any are unreachable. When no MCP servers are configured, all tools continue to work with kubectl only — no changes to existing behavior.
 
   See the [Deployment Guide](https://devopstoolkit.ai/docs/mcp/ai-engine/setup/deployment) for MCP server configuration details and examples. ([#358](https://github.com/vfarcic/dot-ai/issues/358))
-- ## Alibaba Qwen 3.5 Plus Provider
+- **Alibaba Qwen 3.5 Plus Provider**
 
   Added Alibaba's Qwen 3.5 Plus as a new AI provider. Set `AI_PROVIDER=alibaba` with your `ALIBABA_API_KEY` to use Qwen 3.5 Plus, which offers a 262K token context window, 201-language support, and parallel tool calling via a Mixture-of-Experts architecture (397B total, 17B active parameters).
 
   The integration uses the official `@ai-sdk/alibaba` Vercel AI SDK package. API keys are obtained from [Alibaba Cloud Model Studio](https://www.alibabacloud.com/help/en/model-studio/). See the [Deployment Guide](https://devopstoolkit.ai/docs/mcp/ai-engine/setup/deployment) for provider configuration details. ([#382](https://github.com/vfarcic/dot-ai/issues/382))
-- ## Dependency & Impact Analysis
+- **Dependency & Impact Analysis**
 
   New `impact_analysis` tool maps resource dependencies and blast radius before operations, preventing cascading failures from destructive changes like deleting PVCs, upgrading CRDs, or scaling deployments.
 
@@ -143,7 +452,7 @@ No significant changes.
 
 ### Features
 
-- ## GitOps-Aware Remediation
+- **GitOps-Aware Remediation**
 
   The `remediate` tool now detects when Kubernetes resources are managed by GitOps controllers (Argo CD and Flux) and provides Git-based remediation instead of kubectl commands that would be reverted on the next sync.
 
@@ -158,7 +467,7 @@ No significant changes.
 
 ### Other Changes
 
-- ## Proxy-Compatible Authentication Header
+- **Proxy-Compatible Authentication Header**
 
   The REST API now supports `X-Dot-AI-Authorization` as a fallback authentication header. When accessing the API through the Kubernetes API server proxy (e.g., from Headlamp or other dashboard plugins), the standard `Authorization` header is overwritten with a Kubernetes bearer token. Clients can now send their dot-ai token via `X-Dot-AI-Authorization: Bearer <token>` to bypass this limitation.
 
@@ -169,7 +478,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Dex Readiness Probe Timeout
+- **Dex Readiness Probe Timeout**
 
   Fixed intermittent Dex unhealthy events caused by an overly tight readiness probe timeout. The `/healthz/ready` endpoint queries the Kubernetes API server (CRD storage), which can exceed the previous 1-second timeout under normal cluster load. The default readiness probe now uses `timeoutSeconds: 5` and `failureThreshold: 5`, preventing false-positive unhealthy events during routine operations. ([#dex-probe](https://github.com/vfarcic/dot-ai/issues/dex-probe))
 
@@ -178,7 +487,7 @@ No significant changes.
 
 ### Features
 
-- ## GitOps Push-to-Git for Recommend Workflow
+- **GitOps Push-to-Git for Recommend Workflow**
 
   The recommend tool now supports pushing generated manifests directly to a Git repository for GitOps workflows. After generating manifests, agents can use the new `pushToGit` stage to clone a target repository, write manifests to a specified path, and push — eliminating the manual copy-paste step for users running Argo CD, Flux, or similar GitOps controllers.
 
@@ -193,7 +502,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Admin Role Missing User Management Permission
+- **Admin Role Missing User Management Permission**
 
   The built-in `dotai-admin` ClusterRole now grants the `apply` verb on the `users` resource. Previously, admins could view users but not create, update, or delete them, which required a custom ClusterRole as a workaround. Upgrading the Helm chart automatically fixes this for all existing `dotai-admin` bindings. ([#admin-users-apply](https://github.com/vfarcic/dot-ai/issues/admin-users-apply))
 
@@ -202,7 +511,7 @@ No significant changes.
 
 ### Features
 
-- ## User Management Visibility in Tool Discovery
+- **User Management Visibility in Tool Discovery**
 
   The `GET /api/v1/tools` endpoint now includes a virtual `users` entry when the authenticated user has `manageUsers` RBAC permission on the `users` resource. This enables Web UI clients to show or hide user management features based on the user's authorization level, without requiring a separate permissions endpoint.
 
@@ -213,21 +522,21 @@ No significant changes.
 
 ### Features
 
-- ## Kimi K2.5 Model Support
+- **Kimi K2.5 Model Support**
 
   The Kimi AI provider now uses Kimi K2.5, Moonshot AI's latest model with 1T parameters (32B active) in a Mixture-of-Experts architecture and a 256K token context window. K2.5 brings improved coding benchmarks (76.8% SWE-Bench Verified, 85.0% LiveCodeBench v6), native multimodality, and agent swarm support for up to 100 specialized agents with 1,500 simultaneous tool calls.
 
   K2.5 has thinking mode enabled by default, so the separate `kimi_thinking` provider has been removed — set `AI_PROVIDER=kimi` to use thinking mode directly. The Vercel AI SDK has been upgraded to v6 with `@ai-sdk/openai-compatible`, which resolves previous issues with multi-turn tool calling by properly preserving `reasoning_content` in conversation history.
 
   The same `MOONSHOT_API_KEY` environment variable and API endpoint continue to work. If you were using `AI_PROVIDER=kimi_thinking`, switch to `AI_PROVIDER=kimi` — the separate thinking provider has been removed since K2.5 includes thinking by default. See the [Deployment Guide](https://devopstoolkit.ai/docs/mcp/setup/deployment) for provider configuration details. ([#353](https://github.com/vfarcic/dot-ai/issues/353))
-- ## OpenAI GPT-5.4 Model Update
+- **OpenAI GPT-5.4 Model Update**
 
   The default OpenAI model is now GPT-5.4, replacing gpt-5.1-codex. GPT-5.4 is OpenAI's most capable general-purpose model, absorbing the Codex coding capabilities into the main model line with 33% fewer factual errors, more token-efficient reasoning, and a 1M+ token context window (1,050,000 tokens).
 
   No configuration changes are required — the same `OPENAI_API_KEY` environment variable and API endpoint continue to work. Both the `openai` and `custom` provider entries now default to `gpt-5.4`. Users can override the model with the `AI_MODEL` environment variable if needed.
 
   See the [Deployment Guide](https://devopstoolkit.ai/docs/ai-engine/setup/deployment) for the full list of supported models. ([#369](https://github.com/vfarcic/dot-ai/issues/369))
-- ## Kubernetes RBAC Enforcement
+- **Kubernetes RBAC Enforcement**
 
   dot-ai now enforces tool-level authorization for OAuth-authenticated users using Kubernetes RBAC via SubjectAccessReview. Admins control who can use which tools by creating standard Kubernetes RoleBindings against pre-built ClusterRoles shipped in the Helm chart.
 
@@ -256,13 +565,13 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Fix user prompts loading from public git repositories
+- **Fix user prompts loading from public git repositories**
 
   User prompts from public git repositories now load correctly without requiring authentication. Previously, the shared `cloneRepo` function always required a PAT or GitHub App credentials, causing public repos configured via `DOT_AI_USER_PROMPTS_REPO` to fail with "No authentication method configured". The clone and pull functions now fall back to unauthenticated access when no credentials are set.
 
 ### Breaking Changes
 
-- ## Externalize Dex credentials to a user-managed Secret
+- **Externalize Dex credentials to a user-managed Secret**
 
   Dex OAuth credentials (`DEX_CLIENT_SECRET`, `DOT_AI_JWT_SECRET`) are no longer auto-generated by the Helm chart. Instead, users must create a Kubernetes Secret before installing and reference it via `dex.existingSecret`. The admin password bcrypt hash is provided via `dex.adminPasswordHash`. This eliminates the `lookup`-based credential generation that caused "invalid client_secret" errors when deploying via ArgoCD or any tool that uses `helm template`.
 
@@ -273,7 +582,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Preserve dex-credentials secret across Helm upgrades
+- **Preserve dex-credentials secret across Helm upgrades**
 
   Added `helm.sh/resource-policy: keep` to the `dex-credentials` secret so Helm preserves it across upgrades. Previously, each upgrade deleted and recreated the secret, but the Dex pod kept stale environment variables in memory — causing "invalid client_secret" errors until the pod was manually restarted.
 
@@ -282,7 +591,7 @@ No significant changes.
 
 ### Documentation
 
-- ## Update connector docs with dex-credentials requirement
+- **Update connector docs with dex-credentials requirement**
 
   Identity Provider Connectors documentation now shows `dex-credentials` in all `envFrom` examples. When overriding `dex.envFrom` to add connector secrets (e.g., Google OAuth), `dex-credentials` must be included in the list — otherwise OAuth authentication fails because Dex cannot read the client secret environment variable. ([#380](https://github.com/vfarcic/dot-ai/issues/380))
 
@@ -291,10 +600,10 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Fix OAuth login failure after Helm upgrades
+- **Fix OAuth login failure after Helm upgrades**
 
   Helm upgrades no longer break OAuth authentication. Previously, the Dex OIDC config embedded the client secret directly, and the Dex pod didn't restart on upgrades — causing a credential mismatch that produced "invalid client_secret" errors. The chart now uses Dex's `secretEnv` feature to inject the client secret via environment variable (`DEX_CLIENT_SECRET`), keeping the config content stable across upgrades. A dedicated `dex-credentials` secret and `envFrom` injection ensure Dex always reads the correct credentials at runtime without requiring pod restarts. ([#380](https://github.com/vfarcic/dot-ai/issues/380))
-- ## Fix agentic-tools arm64 Docker image build failure
+- **Fix agentic-tools arm64 Docker image build failure**
 
   The agentic-tools plugin Docker image now builds reliably for both amd64 and arm64 architectures. Previously, `npm ci` ran inside the Docker build under QEMU arm64 emulation, which could hang or crash with "Illegal instruction". The build now runs `npm ci` and TypeScript compilation on the native CI runner, then copies the pre-built artifacts into the Docker image. All agentic-tools dependencies are pure JavaScript, so the pre-built output works on both architectures.
 
@@ -303,7 +612,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Fix OAuth login failure after Helm upgrades
+- **Fix OAuth login failure after Helm upgrades**
 
   Helm upgrades no longer break OAuth authentication. Previously, the Dex OIDC config embedded the client secret directly, and the Dex pod didn't restart on upgrades — causing a credential mismatch that produced "invalid client_secret" errors. The chart now uses Dex's `secretEnv` feature to inject the client secret via environment variable (`DEX_CLIENT_SECRET`), keeping the config content stable across upgrades. A dedicated `dex-credentials` secret and `envFrom` injection ensure Dex always reads the correct credentials at runtime without requiring pod restarts. ([#380](https://github.com/vfarcic/dot-ai/issues/380))
 
@@ -317,7 +626,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Resource Status Fetch Concurrency Fix
+- **Resource Status Fetch Concurrency Fix**
 
   The REST API's resource list endpoint now fetches live status in batches of 5 instead of all at once. Previously, requesting `includeStatus=true` for a list of N resources fired N concurrent `kubectl` calls simultaneously via the agentic-tools plugin, overwhelming the pod's CPU and causing liveness probe failures and repeated restarts. Status data now arrives incrementally while keeping the pod stable under load.
 
@@ -326,7 +635,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Fix: Dex Disabled by Default (Issue #396)
+- **Fix: Dex Disabled by Default (Issue #396)**
 
   Fixes a crash when upgrading from v1.5.0 to v1.6.0 with `ingress.tls.enabled: false`. The MCP SDK requires HTTPS for OAuth issuer URLs (per RFC 8414), causing `Error: Issuer URL must be HTTPS` when the chart derived `http://` URLs for setups where TLS terminates at a reverse proxy or load balancer.
 
@@ -339,7 +648,7 @@ No significant changes.
 
 ### Features
 
-- ## MCP OAuth Authentication & User Identity
+- **MCP OAuth Authentication & User Identity**
 
   Adds enterprise-ready authentication with individual user identity tracking. Previously, all users shared a single static token (`DOT_AI_AUTH_TOKEN`) with no way to identify who performed operations, control individual access, or revoke specific users.
 
@@ -354,7 +663,7 @@ No significant changes.
 
 ### Features
 
-- ## Folder-Based Skill Loading
+- **Folder-Based Skill Loading**
 
   User-defined prompts repositories now support folder-based skills alongside flat `.md` files. Previously, skills requiring supporting files (shell scripts, manifests, templates) could only be distributed via git submodules, creating a disconnected distribution mechanism.
 
@@ -367,7 +676,7 @@ No significant changes.
 
 ### Features
 
-- ## On-Demand Prompts Cache Refresh
+- **On-Demand Prompts Cache Refresh**
 
   Force-refresh the prompts cache without restarting the pod or waiting for TTL expiry. Previously, when prompts were updated in a git repository configured via `DOT_AI_USER_PROMPTS_REPO`, users had to wait for the cache TTL to expire or restart the pod to pick up changes.
 
@@ -380,7 +689,7 @@ No significant changes.
 
 ### Features
 
-- ## Helm Day-2 Operations
+- **Helm Day-2 Operations**
 
   The `operate` and `remediate` tools now understand Helm releases, closing the gap between intelligent Helm installation and ongoing management. Previously, after installing third-party applications via the `recommend` tool, users had to drop to manual `helm` CLI commands for upgrades, rollbacks, and troubleshooting.
 
@@ -389,7 +698,7 @@ No significant changes.
   Four new investigation tools (`helm_list`, `helm_status`, `helm_history`, `helm_get_values`) and a `helm_rollback` operation tool are available to the AI agent during analysis. The existing `helm_install` tool now supports Day-2 upgrades with `--reuse-values` enabled by default, and a new `helm_install_dryrun` variant enables safe validation during the analysis phase.
 
   See the [Operate Tool Guide](https://devopstoolkit.ai/docs/mcp/ai-engine/tools/operate) and [Remediate Tool Guide](https://devopstoolkit.ai/docs/mcp/ai-engine/tools/remediate) for details. ([#251](https://github.com/vfarcic/dot-ai/issues/251))
-- ## Local Embedding Service
+- **Local Embedding Service**
 
   Optional in-cluster embedding service that provides zero-config semantic search without external API keys. Previously, semantic search (patterns, policies, capabilities, knowledge base) required configuring an OpenAI, Google, or Amazon Bedrock API key for embeddings — adding setup friction for new users, blocking air-gapped deployments, and incurring per-token costs.
 
@@ -403,12 +712,12 @@ No significant changes.
 
 ### Other Changes
 
-- ## Gemini 3.1 Pro Upgrade
+- **Gemini 3.1 Pro Upgrade**
 
   The Google AI provider now uses Gemini 3.1 Pro (`gemini-3.1-pro-preview`), replacing Gemini 3 Pro. Gemini 3.1 Pro offers improved thinking, better token efficiency, and more reliable tool usage for agentic workflows.
 
   Integration test timeouts for capability scanning and Helm operations have been increased to accommodate variance across model providers. ([#gemini-upgrade](https://github.com/vfarcic/dot-ai/issues/gemini-upgrade))
-- ## Claude Sonnet 4.6 Upgrade
+- **Claude Sonnet 4.6 Upgrade**
 
   The default Anthropic provider now uses Claude Sonnet 4.6 (`claude-sonnet-4-6`), replacing Claude Sonnet 4.5. Sonnet 4.6 delivers near-Opus intelligence with improved coding, long-context reasoning, and agent planning, while maintaining the same pricing tier. The Amazon Bedrock default model has also been updated to `global.anthropic.claude-sonnet-4-6`. ([#sonnet-upgrade](https://github.com/vfarcic/dot-ai/issues/sonnet-upgrade))
 
@@ -417,7 +726,7 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Plugin Readiness Probe Timing
+- **Plugin Readiness Probe Timing**
 
   The agentic-tools plugin readiness probe `initialDelaySeconds` is now 30 seconds (previously 5 seconds). The aggressive 5-second delay caused spurious readiness probe failures during pod startup, triggering unnecessary rolling restarts when the container needed more time to initialize. ([#readiness-probe](https://github.com/vfarcic/dot-ai/issues/readiness-probe))
 
@@ -426,7 +735,7 @@ No significant changes.
 
 ### Documentation
 
-- ## Documentation Restructured into AI Engine and MCP Sections
+- **Documentation Restructured into AI Engine and MCP Sections**
 
   Documentation now reflects the actual product architecture with two top-level sections instead of a single MCP-centric hierarchy. The previous structure implied MCP was the only way to use DevOps AI Toolkit — the new structure presents the AI Engine as the product and MCP as one of several access methods alongside CLI.
 
@@ -439,7 +748,7 @@ No significant changes.
 
 ### Features
 
-- ## Claude Opus 4.6 Model Support
+- **Claude Opus 4.6 Model Support**
 
   The default Anthropic Opus model is now Claude Opus 4.6, replacing Claude Opus 4.5. Opus 4.6 brings a 1M token context window (beta), 128K max output tokens, adaptive thinking controls, and improved agentic coding performance—all at the same pricing as Opus 4.5.
 
@@ -447,10 +756,10 @@ No significant changes.
 
 ### Bug Fixes
 
-- ## Fix ESLint Lint Script
+- **Fix ESLint Lint Script**
 
   The `npm run lint` command now works correctly with the project's flat config (`eslint.config.js`). The `--ext .ts` flag was removed as it is not supported in flat config mode, which caused builds to fail locally. ([#370](https://github.com/vfarcic/dot-ai/issues/370))
-- ## User Prompts No Longer Require Category Field
+- **User Prompts No Longer Require Category Field**
 
   User prompts loaded from external git repositories now correctly load when their YAML frontmatter contains only `name` and `description`. Previously, prompts missing the `category` field were silently skipped during loading, causing the prompts API to return fewer prompts than expected with no error or warning to the caller.
 
@@ -461,14 +770,14 @@ No significant changes.
 
 ### Features
 
-- ## REST API Route Registry with Complete OpenAPI Documentation
+- **REST API Route Registry with Complete OpenAPI Documentation**
 
   The REST API now provides complete OpenAPI documentation for all endpoints through a new route registry system. Previously, only tool endpoints (`/api/v1/tools/*`) were documented, while visualization, session, resource, and event endpoints lacked OpenAPI coverage. Adding new endpoints required manual updates to both the router and documentation, which frequently fell out of sync.
 
   All REST endpoints are now defined in a centralized route registry with Zod schemas for request and response validation. The OpenAPI specification at `/api/v1/openapi` is auto-generated from these schemas, ensuring documentation always matches implementation. Endpoints for visualizations, sessions, resources, events, prompts, and tools are fully documented with accurate request/response schemas and error responses.
 
   A mock server is available as a Docker image (`ghcr.io/vfarcic/dot-ai-mock-server:latest`) for integration testing and UI development. The mock server serves realistic fixture data for all endpoints, enabling Playwright tests and local development without a live cluster. Add it to docker-compose with `docker compose up mock-api` and point tests to `http://mock-api:3001`. ([#354](https://github.com/vfarcic/dot-ai/issues/354))
-- ## Knowledge Base System
+- **Knowledge Base System**
 
   Ingest, search, and query organizational knowledge from any source. Organizations often have valuable documentation scattered across Git repositories, wikis, and internal systems that AI assistants cannot access for context-aware recommendations.
 
@@ -482,7 +791,7 @@ No significant changes.
 
 ### Other Changes
 
-- ## Qdrant Operations Plugin Migration
+- **Qdrant Operations Plugin Migration**
 
   Vector database operations now run through the agentic-tools plugin instead of being embedded in the MCP server. This architectural change removes ~2,500 lines of Qdrant-specific code from the MCP server and consolidates all vector storage operations into a single plugin.
 
@@ -491,7 +800,7 @@ No significant changes.
   Plugin tool invocation is now unified across the codebase via a central registry (`invokePluginTool()`), replacing inconsistent patterns where some tools received `pluginManager` as a parameter while others used module-level setters. All kubectl, helm, shell, and vector tools now use the same invocation pattern.
 
   Qdrant configuration (`QDRANT_URL`, `QDRANT_API_KEY`) moves from MCP server to the agentic-tools plugin. Helm chart deployments handle this automatically. ([#359](https://github.com/vfarcic/dot-ai/issues/359))
-- ## ESLint 9.x Upgrade
+- **ESLint 9.x Upgrade**
 
   Upgraded to ESLint 9.x with the new flat config format. The TypeScript ESLint packages were updated from v6 to v8, bringing improved type checking and stricter linting rules. This internal tooling update ensures compatibility with current ESLint ecosystem and enables better code quality checks during development. ([#365](https://github.com/vfarcic/dot-ai/issues/365))
 
@@ -518,7 +827,7 @@ No significant changes.
 
 ### Breaking Changes
 
-- ## Kubernetes-Only Deployment
+- **Kubernetes-Only Deployment**
 
   dot-ai now requires Kubernetes for deployment. Docker Compose, npx, and local standalone deployment options have been removed, along with ToolHive and kagent integration. This simplifies the codebase and documentation by establishing a single, consistent deployment model.
 
@@ -551,7 +860,7 @@ No significant changes.
 
 ### Breaking Changes
 
-- ## Kubernetes-Only Deployment
+- **Kubernetes-Only Deployment**
 
   dot-ai now requires Kubernetes for deployment. Docker Compose, npx, and local standalone deployment options have been removed, along with ToolHive and kagent integration. This simplifies the codebase and documentation by establishing a single, consistent deployment model.
 

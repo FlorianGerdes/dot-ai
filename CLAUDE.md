@@ -21,8 +21,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. **Always Run All Tests**: Before marking any task complete, run `npm run test:integration`
 3. **Never Claim Done with Failing Tests**: A task is NOT complete if any tests are failing
 4. **Always Check for Reusability**: Search codebase for existing functions before implementing new ones
-5. **Never Hardcode AI Prompts**: All prompts go in `prompts/` directory, loaded dynamically (see existing code for pattern)
+5. **Never Hardcode AI Prompts**: All prompts go in `prompts/` (internal) or `shared-prompts/` (user-facing), loaded dynamically (see existing code for pattern)
 6. **Never Create Branches Directly — Always Use Worktrees**: When starting feature work (including `/prd-start`), always use `/worktree-prd` to create an isolated worktree. Never run `git checkout -b` or `git switch -c`, even if a skill instructs you to.
+7. **Always Configure New Params via Helm Chart Values**: Every NEW configuration parameter must be a first-class value in `charts/values.yaml`, rendered into the container env by `charts/templates/deployment.yaml` — follow `rbac.enforcement.enabled` → `DOT_AI_RBAC_ENABLED`, where the chart value is the user-facing contract and the env var is an internal detail. Never introduce a bare env var, and never document a new param under `extraEnv` (not even as an interim step). The many `DOT_AI_*` env vars in the codebase are legacy from when the project ran outside Kubernetes; it is Kubernetes-only now, so the chart is the single configuration interface. `extraEnv` remains valid only for pre-existing env vars (e.g. `DOT_AI_GIT_TOKEN`) and third-party config such as OTEL.
+8. **Never Store Project Knowledge in Agent Memory**: Anything learned about this project — conventions, decisions, gotchas, rationale — goes in the repo where the whole team and every agent can see it: this file for rules, `docs/` for user-facing behavior, a PRD in `prds/` for in-flight design. Never persist it to per-user agent memory outside the repo (e.g. `~/.claude/**/memory/`), which teammates cannot see, code review cannot catch, and nothing keeps in sync with the code. The narrow exception is a fact true only of one machine or account (host tooling quirks, personal credentials paths) — that is not project knowledge and does not belong in the repo either.
 
 ## Testing Workflow
 
@@ -52,28 +54,13 @@ npm run test:integration version     # Run specific test by pattern
 
 ## Project Conventions
 
-**AI Prompts**: Store in `prompts/` (internal) or `shared-prompts/` (user-facing). Never hardcode.
-
 **Temporary Files**: Always use `./tmp` for any temporary files, never `/tmp`
 
 **Test Clusters**: Integration tests create `./kubeconfig-test.yaml` in project root
 
 **Git Commits**: CI runs automatically on PRs targeting `main`. Use `workflow_dispatch` in GitHub Actions to manually trigger CI on any branch.
 
-**Changelog Fragments**: Place in `changelog.d/` using towncrier naming: `<description>.<type>.md` where type must match `pyproject.toml` types: `feature`, `bugfix`, `breaking`, `doc`, `misc`. Example: `465-fix-duplicate-env.bugfix.md`. Do NOT use shorthand like `.fix.md` — towncrier won't recognize it.
-
 **Running Integration Tests via CI**: When the local cluster is unavailable (e.g., in use by parallel work), use `workflow_dispatch` in GitHub Actions to trigger the CI pipeline on your branch.
-
-## Git Worktrees for Feature Work
-
-**Starting feature work:** Run `/worktree-prd` to create an isolated worktree with a feature branch.
-
-**Finishing feature work:** After merging, clean up from the main directory:
-```bash
-git worktree remove ../dot-ai-[branch-name]
-```
-
-**Why:** Keeps main directory on `main` branch, enables parallel work on multiple features, and ensures each agent session has consistent context for its branch.
 
 ## MCP vs Plugin Architecture
 

@@ -43,11 +43,44 @@ spec:
         - name: SESSION_MODE
           value: "stateful"
         # AI Provider configuration
+        # Issue #474: Only emit AI_PROVIDER when explicitly set so that leaving
+        # ai.provider empty enables the auto-detect 'custom' branch in
+        # ai-provider-factory.ts when customEndpoint is configured.
+{{- if .Values.ai.provider }}
         - name: AI_PROVIDER
-          value: {{ .Values.ai.provider | default "anthropic" | quote }}
+          value: {{ .Values.ai.provider | quote }}
+{{- end }}
 {{- if .Values.ai.model }}
         - name: AI_MODEL
           value: {{ .Values.ai.model | quote }}
+{{- end }}
+        # AI SDK retry tuning (PRD #459)
+        # Empty values fall through to per-operation defaults in src/core/ai-retry-config.ts.
+{{- if .Values.ai.retries.default }}
+        - name: DOT_AI_AI_MAX_RETRIES
+          value: {{ .Values.ai.retries.default | quote }}
+{{- end }}
+{{- if .Values.ai.retries.embeddings }}
+        - name: DOT_AI_AI_MAX_RETRIES_EMBEDDINGS
+          value: {{ .Values.ai.retries.embeddings | quote }}
+{{- end }}
+{{- if .Values.ai.retries.chat }}
+        - name: DOT_AI_AI_MAX_RETRIES_CHAT
+          value: {{ .Values.ai.retries.chat | quote }}
+{{- end }}
+{{- if .Values.ai.retries.toolLoop }}
+        - name: DOT_AI_AI_MAX_RETRIES_TOOL_LOOP
+          value: {{ .Values.ai.retries.toolLoop | quote }}
+{{- end }}
+{{- if .Values.ai.retries.wrapUp }}
+        - name: DOT_AI_AI_MAX_RETRIES_WRAP_UP
+          value: {{ .Values.ai.retries.wrapUp | quote }}
+{{- end }}
+        # MCP progress heartbeat (PRD #705)
+        # Empty falls through to the default in src/interfaces/request-context.ts.
+{{- if .Values.mcp.progress.heartbeatIntervalMs }}
+        - name: DOT_AI_MCP_PROGRESS_INTERVAL_MS
+          value: {{ .Values.mcp.progress.heartbeatIntervalMs | quote }}
 {{- end }}
 {{- if .Values.ai.customEndpoint.enabled }}
         - name: CUSTOM_LLM_BASE_URL
@@ -116,6 +149,12 @@ spec:
               name: {{ .Values.secrets.name }}
               key: {{ .Values.secrets.alibaba.keyName }}
               optional: true
+        - name: GITHUB_COPILOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secrets.name }}
+              key: {{ .Values.secrets.copilot.keyName }}
+              optional: true
         - name: CUSTOM_LLM_API_KEY
           valueFrom:
             secretKeyRef:
@@ -160,6 +199,15 @@ spec:
             fieldRef:
               fieldPath: metadata.namespace
 {{- end }}
+        # GitOps repository host allowlist (PRD #710)
+        # Always rendered: an ABSENT value falls back to the server's secure
+        # default (github.com), and an EMPTY list must reach the server as an
+        # explicit deny-all rather than as "not configured".
+        # Parenthesised so a `gitops: null` map — which an umbrella chart or a
+        # trimmed values file can produce — renders as the empty deny-all list
+        # instead of failing `helm template` with a nil pointer.
+        - name: DOT_AI_GITOPS_ALLOWED_REPO_HOSTS
+          value: {{ (.Values.gitops).allowedRepoHosts | default list | join "," | quote }}
         # Git authentication (PRD #362: Git Operations)
         # Note: DOT_AI_GIT_TOKEN is configured via extraEnv - reused from user-prompts feature
         - name: GITHUB_APP_ENABLED

@@ -102,6 +102,7 @@ helm install dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSI
 - **Custom endpoints** (OpenRouter, self-hosted): See [Custom Endpoint Configuration](#custom-endpoint-configuration) for environment variables, then use `--set` or values file with `ai.customEndpoint.enabled=true` and `ai.customEndpoint.baseURL`.
 - **Observability/Tracing**: Add tracing environment variables via `extraEnv` in your values file. See [Observability Guide](../operations/observability.md) for complete configuration.
 - **User-Defined Prompts**: Load custom prompts from your git repository via `extraEnv`. See [User-Defined Prompts](../tools/prompts.md#user-defined-prompts) for configuration.
+- **GitOps push targets**: `gitops.allowedRepoHosts` lists the repository hosts the `pushToGit` stage may push to, and defaults to `["github.com", "www.github.com"]`. Pushing to GitLab, Bitbucket, or a self-hosted host requires adding it. See [GitOps Repository Host Allowlist](#gitops-repository-host-allowlist).
 
 ### Step 4: Connect a Client
 
@@ -148,6 +149,7 @@ All AI models must meet these minimum requirements:
 | **Host** | Host Environment LLM | `host` | None (uses host's AI) | Yes (if supported) |
 | **Moonshot AI** | Kimi K2.5 | `kimi` | `MOONSHOT_API_KEY` | Yes |
 | **Alibaba** | Qwen 3.5 Plus | `alibaba` | `ALIBABA_API_KEY` | Yes |
+| **GitHub Copilot** | Claude Sonnet 4.6 (via Copilot) | `copilot` | `GITHUB_COPILOT_TOKEN` | Yes |
 | **OpenAI** | GPT-5.4 | `openai` | `OPENAI_API_KEY` | No * |
 | **xAI** | Grok-4 | `xai` | `XAI_API_KEY` | No * |
 
@@ -186,7 +188,200 @@ helm install dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSI
   # ... other settings
 ```
 
+#### GitHub Copilot (no per-token billing)
+
+Use your existing GitHub Copilot subscription instead of a pay-per-token API:
+
+> **Important — unofficial integration notice**
+>
+> This provider sends requests directly to `api.githubcopilot.com` using VS Code-style
+> headers (`Copilot-Integration-Id: vscode-chat`, `Editor-Version: vscode/1.104.1`).
+> This mirrors the approach used by other third-party tools (e.g. `opencode`) — it is
+> **not** an officially documented or supported GitHub API path.
+>
+> Operators should be aware of the following before deploying:
+>
+> - ❌ **May break without notice.** GitHub may change the Copilot API, required headers,
+>   or authentication model at any time.
+> - 🎯 **Terms of service.** Review the GitHub Copilot terms for your subscription tier
+>   (Individual, Business, or Enterprise). Third-party clients using VS Code-style headers
+>   may not be permitted under all tiers.
+> - 🔧 **No official support from GitHub.** Issues caused by API changes cannot be resolved
+>   through GitHub support.
+
+```bash
+# Set your GitHub OAuth token (gho_* prefix, from a Copilot-enabled account)
+# Obtain one with: gh auth token  (requires gh CLI)
+export GITHUB_COPILOT_TOKEN="gho_..."
+
+helm install dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSION \
+  --set ai.provider=copilot \
+  --set secrets.copilot.token="$GITHUB_COPILOT_TOKEN" \
+  --set secrets.auth.token="$DOT_AI_AUTH_TOKEN" \
+  --set ingress.enabled=true \
+  --set ingress.className="$INGRESS_CLASS_NAME" \
+  --set ingress.host="dot-ai.127.0.0.1.nip.io" \
+  --namespace dot-ai \
+  --wait
+```
+
+Supported token formats: `gho_*` (OAuth, recommended) and `ghu_*` (GitHub App). Personal access tokens (`github_pat_*` fine-grained PATs and `ghp_*` classic PATs) are not supported by `api.githubcopilot.com`. The resolver checks `GITHUB_COPILOT_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN` env vars in that priority order. Note: the `gh auth token` CLI fallback is not available in Kubernetes deployments where `gh` is not installed — supply the token explicitly via the env var.
+
 **AI Keys Are Optional**: The MCP server starts successfully without AI API keys. Tools like **Shared Prompts Library** and **REST API Gateway** work without AI. AI-powered tools (deployment recommendations, remediation, pattern/policy management, capability scanning) require AI keys (unless using the `host` provider) and will show helpful error messages when accessed without configuration.
+
+### Retry Tuning (Optional)
+
+The Vercel AI SDK retries transient failures (HTTP 429/5xx and network errors) with exponential backoff. The dot-ai server configures `maxRetries` per operation so you can trade resilience against responsiveness:
+
+| Operation | Default `maxRetries` | Helm value | Env var (runtime) |
+|-----------|----------------------|------------|-------------------|
+| `embeddings` (single + batch) | `4` | `ai.retries.embeddings` | `DOT_AI_AI_MAX_RETRIES_EMBEDDINGS` |
+| `chat` (single-turn `generateText`) | `2` | `ai.retries.chat` | `DOT_AI_AI_MAX_RETRIES_CHAT` |
+| `tool_loop` (agentic multi-step) | `2` | `ai.retries.toolLoop` | `DOT_AI_AI_MAX_RETRIES_TOOL_LOOP` |
+| `wrap_up` (final summary after a tool loop) | `1` | `ai.retries.wrapUp` | `DOT_AI_AI_MAX_RETRIES_WRAP_UP` |
+
+Set `ai.retries.default` (env var `DOT_AI_AI_MAX_RETRIES`) to override every operation with the same value. A per-operation value always wins over the global one. Values must be non-negative integers; empty or invalid values fall back to the next level (per-op, then global, then the built-in default above). Set a value to `0` to disable retries for an operation.
+
+Configure via typed Helm values (preferred):
+
+```yaml
+ai:
+  retries:
+    chat: "1"            # fail interactive chat fast
+    embeddings: "6"      # tolerate flaky embedding endpoints
+```
+
+Or via `--set`:
+
+```bash
+helm install dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSION \
+  --set ai.retries.chat="1" \
+  --set ai.retries.embeddings="6" \
+  # ... other settings
+```
+
+The chart templates these into the env vars consumed by `src/core/ai-retry-config.ts`. As a fallback, you can still set the env vars directly via `extraEnv` (useful for testing without re-rendering the chart):
+
+```yaml
+extraEnv:
+  - name: DOT_AI_AI_MAX_RETRIES_CHAT
+    value: "1"
+```
+
+#### Verifying the rendered env vars
+
+You can preview exactly which env vars the chart will inject before installing. With the defaults (empty values), no `DOT_AI_AI_MAX_RETRIES*` env vars are rendered and the per-operation defaults in `src/core/ai-retry-config.ts` take effect:
+
+```bash
+$ helm template dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSION \
+    --set secrets.auth.token=t --set secrets.anthropic.apiKey=k \
+  | grep DOT_AI_AI_MAX_RETRIES
+# (no output — no retry env vars rendered, defaults from code apply)
+```
+
+With overrides, only the env vars you set are emitted:
+
+```bash
+$ helm template dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSION \
+    --set secrets.auth.token=t --set secrets.anthropic.apiKey=k \
+    --set ai.retries.chat=1 --set ai.retries.embeddings=6 \
+  | grep -A1 DOT_AI_AI_MAX_RETRIES
+        - name: DOT_AI_AI_MAX_RETRIES_EMBEDDINGS
+          value: "6"
+        - name: DOT_AI_AI_MAX_RETRIES_CHAT
+          value: "1"
+```
+
+## Progress Notifications for Long-Running Calls
+
+Some tool calls take minutes. `recommend` in particular can run for well over two minutes on a large cluster, and for most of that time it is blocked on the AI provider with no bytes flowing. A proxy or load balancer sitting in front of the server sees an idle connection and drops it — the server finishes the work, but the client already gave up.
+
+To prevent that, the server emits MCP `notifications/progress` for the whole duration of every tool call, driven by a fixed-interval heartbeat. The heartbeat guarantees traffic on the connection regardless of what the tool is doing internally; `recommend` layers human-readable phase labels on top of it ("Searching organizational knowledge…", "Generating configuration questions (2/3)…"), which clients that surface progress messages will display.
+
+Progress is **opt-in per call**. A client opts in by sending `_meta.progressToken` on `tools/call` — most MCP SDKs do this automatically when the caller registers a progress handler. Clients that send no token, and all REST API callers, are completely unaffected.
+
+### Sizing the heartbeat against your load balancer
+
+The interval must be comfortably shorter than the idle timeout of every hop between the client and the server. The default of 20s is chosen to sit inside a 60s idle timeout, which is the default for an AWS ALB and for most nginx-style proxies.
+
+| Your shortest idle timeout | Recommended `heartbeatIntervalMs` |
+|----------------------------|-----------------------------------|
+| 60s (AWS ALB default, common nginx default) | `20000` (the built-in default — no configuration needed) |
+| 30s | `10000` |
+| 120s or higher | `20000` is still fine; raising it only reduces notification volume |
+
+If in-flight requests are still being dropped, the idle timeout on some hop is shorter than your interval. Lower the interval rather than raising the timeout.
+
+### Configuration
+
+| Setting | Default | Helm value | Env var (runtime) |
+|---------|---------|------------|-------------------|
+| Heartbeat interval, in milliseconds | `20000` | `mcp.progress.heartbeatIntervalMs` | `DOT_AI_MCP_PROGRESS_INTERVAL_MS` |
+
+Configure via typed Helm values (preferred):
+
+```yaml
+mcp:
+  progress:
+    heartbeatIntervalMs: "10000"   # for a proxy with a 30s idle timeout
+```
+
+Or via `--set`:
+
+```bash
+helm install dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSION \
+  --set mcp.progress.heartbeatIntervalMs="10000" \
+  # ... other settings
+```
+
+Leaving the value empty (the default) renders no env var at all, and the built-in 20s interval applies:
+
+```bash
+$ helm template dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSION \
+    --set secrets.auth.token=t --set secrets.anthropic.apiKey=k \
+  | grep DOT_AI_MCP_PROGRESS_INTERVAL_MS
+# (no output — no env var rendered, the 20s default from code applies)
+```
+
+Setting it emits the env var:
+
+```bash
+$ helm template dot-ai-mcp oci://ghcr.io/vfarcic/dot-ai/charts/dot-ai:$DOT_AI_VERSION \
+    --set secrets.auth.token=t --set secrets.anthropic.apiKey=k \
+    --set mcp.progress.heartbeatIntervalMs=10000 \
+  | grep -A1 DOT_AI_MCP_PROGRESS_INTERVAL_MS
+        - name: DOT_AI_MCP_PROGRESS_INTERVAL_MS
+          value: "10000"
+```
+
+### Client timeout behavior
+
+The heartbeat solves the proxy/load-balancer problem unconditionally. Whether it also prevents the *client* from timing out depends on the client, because a client enforces its own deadline independently of any network hop:
+
+| Client | Sends `progressToken`? | Extends its own deadline on progress? | What you need to do |
+|--------|------------------------|----------------------------------------|---------------------|
+| **Claude Code** | Yes, automatically | Yes — it resets its own idle timer on every notification | Nothing |
+| **MCP TypeScript SDK** (custom clients) | Only if you register an `onprogress` handler | Only if you pass `resetTimeoutOnProgress` | Pass both, see below |
+| **Cursor** | Not verified | Not verified | Test before relying on it |
+
+Claude Code needs no configuration. It registers a progress handler on every tool call, so the token is sent automatically, and it resets its own idle timeout (default 300s for a remote HTTP server, `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`) each time a notification arrives.
+
+If you are building a client directly on the MCP TypeScript SDK, the default request timeout is 60s and progress alone does not extend it. Pass both options:
+
+```typescript
+await client.callTool(
+  { name: 'recommend', arguments: { /* ... */ } },
+  undefined,
+  {
+    onprogress: p => console.log(p.message),  // makes the SDK send the progressToken
+    resetTimeoutOnProgress: true,             // extends the deadline on each notification
+    timeout: 60000,
+    maxTotalTimeout: 300000,                  // absolute ceiling, never extended
+  }
+);
+```
+
+Without `resetTimeoutOnProgress`, such a client aborts at 60s no matter how much progress the server reports.
 
 ## Embedding Provider Configuration
 
@@ -225,6 +420,20 @@ localEmbeddings:
       cpu: "1"
       memory: "512Mi"
 ```
+
+#### Embedding model prefetch (HuggingFace Xet workaround) {#local-embeddings-prefetch}
+
+TEI's built-in downloader cannot fetch **embedding models** whose weights are served from HuggingFace's [Xet](https://huggingface.co/docs/hub/en/storage-backends) storage backend — the local-embeddings pod crash-loops at startup with `Weights not found: Header content-range is missing`. If you hit this, enable `prefetch`: an init container downloads the embedding model with a Xet-aware `huggingface_hub` client into a shared volume, and TEI then loads it locally (`HF_HUB_OFFLINE=1`) instead of using its own downloader.
+
+```yaml
+localEmbeddings:
+  enabled: true
+  prefetch:
+    enabled: true                   # default: false
+    image: "python:3.12-slim"       # downloader image; installs huggingface_hub[hf_xet]
+```
+
+> ⚠️ **When to leave it off (the default):** prefetch requires PyPI **and** HuggingFace to be reachable at pod startup and only supports **public, non-gated** models (no `HF_TOKEN` is passed). Leave it disabled for air-gapped clusters, gated/private models, a `model:` set to a local path, or a custom pre-baked TEI image — in those cases prefetch would break a setup that otherwise works.
 
 To disable local embeddings (e.g., if using a cloud provider instead):
 
@@ -393,7 +602,7 @@ OpenRouter provides access to 100+ LLM models from multiple providers:
 ```yaml
 ai:
   provider: openai
-  model: "anthropic/claude-3.5-sonnet"
+  model: "anthropic/claude-haiku-4.5"
   customEndpoint:
     enabled: true
     baseURL: "https://openrouter.ai/api/v1"
@@ -629,6 +838,125 @@ The response includes an `mcpServers` section showing connected servers, their e
 - **No MCP servers configured** (default): dot-ai starts normally without MCP server augmentation.
 - **MCP servers configured**: dot-ai connects to each enabled server at startup, discovers tools, and makes them available to the configured operations.
 - **MCP server unreachable**: Startup **fails fast** with a clear error message. Configured MCP servers must be reachable — there is no background retry. Fix the endpoint or disable the server entry to proceed.
+
+## GitOps Repository Host Allowlist
+
+The `pushToGit` stage of the [recommend](../tools/recommend.md#option-gitops-deployment) tool takes its repository URL **from the caller**, and the server attaches **its own** Git credential (`DOT_AI_GIT_TOKEN`, or a GitHub App installation token) to whatever URL it is given. Without a check on the host, any caller allowed to run `recommend` could name a repository on a host they control and have the server's credential delivered there — and left behind in that clone's `.git/config`.
+
+`gitops.allowedRepoHosts` is that check. It lists the repository hosts a client-supplied URL may name:
+
+```yaml
+# values.yaml
+gitops:
+  allowedRepoHosts:
+    - github.com          # both defaults — setting the value replaces them,
+    - www.github.com      # so re-list the ones you still need
+    - gitlab.example.com  # add each additional host explicitly
+```
+
+Or as a flag on the [Step 3](#step-3-install-the-server) install command — add this line to it, alongside the `--set` values already there, rather than running it as a command of its own (a Helm command that omits your other values drops them):
+
+```bash
+  --set-json 'gitops.allowedRepoHosts=["github.com","www.github.com","gitlab.example.com"]' \
+```
+
+The list the server actually received is in the container's environment, which is the quickest way to confirm a value that only takes effect on restart:
+
+```bash
+kubectl get deployment dot-ai-mcp --namespace dot-ai \
+  --output jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DOT_AI_GITOPS_ALLOWED_REPO_HOSTS")].value}{"\n"}'
+```
+
+```text
+github.com,www.github.com,gitlab.example.com
+```
+
+An empty line there is the deny-all case rather than "not configured" — see the unset-vs-empty table below.
+
+> **This is not the RBAC gate.** [Authorization](authorization.md#git-push-direct-push-or-pull-request) decides *who* may push and *how* (direct push needs `apply`, pull request mode needs `execute`) — it protects your **cluster**. The allowlist decides *which hosts* the server will hand its Git credential to — it protects the **server's credential**. Both apply independently: a user with `apply` still cannot push to a host that is not listed, and listing a host grants no one permission to push.
+
+### Matching Rules
+
+| Rule | Consequence |
+|------|-------------|
+| The URL must be **`https://`**, whatever the host | `https:` is the only scheme that can carry the server's credential safely, so `http://github.com/org/repo.git`, `ssh://…`, `git://…` and the scp-style `github.com:org/repo.git` shorthand are all outside the allowlist even though the host is listed. Write the HTTPS clone URL. |
+| Entries are **hostnames**, compared against the parsed host of the URL | `https://github.com@attacker.example/x.git` is checked as `attacker.example`, not `github.com` — a host cannot be smuggled in via userinfo |
+| **Exact** match, **case-insensitive** | `GitHub.com` in the value matches `https://GITHUB.com/org/repo.git` |
+| **No wildcards, no substring matching** | `github.com` does **not** cover `github.company.example`, `github.com.evil.example`, or any subdomain of a listed host — list every host your callers actually use. This is also why the default names `github.com` and `www.github.com` as two separate literal entries: neither one covers the other. |
+| A `:port` suffix is accepted and **ignored**, on both sides | `gitlab.example.com:8443` in the value matches `https://gitlab.example.com/org/repo.git` and vice versa (the credential reaches the host whichever port answers) |
+| A URL whose host cannot be parsed is **not** allowed | Unparseable remotes are refused rather than guessed at. `pushToGit` expects the HTTPS clone URL, as in the [recommend examples](../tools/recommend.md#option-gitops-deployment) |
+
+**Unset vs. empty — the asymmetry is deliberate:**
+
+| Value | Meaning |
+|-------|---------|
+| Not set (a deployment predating this value, or a server started outside the chart) | Falls back to the default, `["github.com", "www.github.com"]` — **not** "allow everything". An older deployment must not silently become wide open. |
+| `allowedRepoHosts: []` | **Deny-all**, including `github.com` and `www.github.com`. An empty list is read as an explicit decision, never as "not configured". To allow a host, name it. |
+| `gitops: null` — the key left in your values with nothing under it (`gitops:` on a line of its own, or `--set gitops=null`) | **Deny-all**, exactly like `[]`. Helm does not merge the chart default into an explicit null, so nothing is rendered and the server reads an empty allowlist. This is the one case where "I removed my setting" and "I emptied my setting" part ways: deleting the `gitops:` block **entirely** keeps the default `["github.com", "www.github.com"]`, and so does `gitops: {}`. |
+
+### What the Allowlist Gates
+
+The same value gates three different callers, with deliberately different consequences:
+
+| Caller | Behavior on a host that is not listed |
+|--------|----------------------------------------|
+| `pushToGit` — **both** direct push and pull request mode | ❌ **Refused.** The request fails before any credential is minted, cloned with, or pushed with. |
+| The per-request prompts override (`?repo=`) — see [Shared Prompt Library](../tools/prompts.md#the-server-credential-and-the-host-allowlist) | ⚠️ **Degraded, not refused.** The clone still happens, but **unauthenticated**: the server's credential is withheld. Public repositories are unaffected; a private one needs the `X-Dot-AI-Git-Token` request header. |
+| The [remediate](../tools/remediate.md) tool's repository clone | ⚠️ **Degraded, not refused**, the same way. A public GitOps repository on any host keeps cloning; a **private** one on an unlisted host now fails to clone. Remediate has no per-request credential header, so adding the host is the only remedy. |
+
+A URL that is not `https://` fails the same check, whatever host it names — but the consequence is only *mostly* the same. For `pushToGit` and for remediate it is identical: refused and cloned-unauthenticated respectively, on any non-`https://` scheme. For the prompts override, `http://` is the only non-`https://` scheme that reaches this decision and degrades; `ssh://`, `git://`, and `file://` are rejected with `HTTP 400` by input validation before the credential decision happens, so that caller sees a refusal rather than a degradation. See [Matching Rules](#matching-rules).
+
+The prompts override has one more refusal that is **not** this allowlist and needs no configuration: a `?repo=` host that is a non-public **IP literal** (loopback, private, link-local such as `169.254.169.254`, and so on) is rejected with `HTTP 400` before anything is cloned, on either scheme and regardless of the `X-Dot-AI-Git-Token` header. It applies only to the caller-supplied URL — never to `DOT_AI_USER_PROMPTS_REPO` — and it classifies literals, not names. See [what the override fetch exposes](../tools/prompts.md#what-the-override-fetch-exposes).
+
+**Not gated** — this needs no allowlist entry:
+
+- **`DOT_AI_USER_PROMPTS_REPO`** — the operator's own prompts repository. Pointing it at a private GitLab, Gitea, or Forgejo works exactly as before; the URL is the operator's choice, not a caller's.
+
+> **Why remediate is gated even though no client parameter names its repository.** The URL is chosen by the model, and the model's context includes the caller's free-text issue description and cluster objects a tenant may be able to write — so it is client-*influenced*, which is enough to hand the server's credential somewhere it should not go. Unlike a push, cloning happens during investigation, which has no approval step.
+
+**If remediate stops cloning a private GitOps repository after upgrading**, check the host first: unlike the prompts override, this path does not explain the withheld credential. The clone is simply attempted unauthenticated, so what remediate reports is git's own failure, which names a credential or a missing repository but never the allowlist — for a private GitHub repository it reads:
+
+```text
+Error cloning repository: Cloning into '<clone-dir>'...
+fatal: could not read Username for 'https://github.com': No such device or address
+```
+
+Add the host to `gitops.allowedRepoHosts` and retry. Public repositories are unaffected on any host.
+
+### When a Push Is Refused
+
+`pushToGit` names the host and the value to change:
+
+```text
+Repository host "gitlab.example.com" is not allowed. Currently allowed: github.com,
+www.github.com. To allow it, add the host to the "gitops.allowedRepoHosts" Helm
+value (default: github.com, www.github.com) and restart the server.
+```
+
+With `allowedRepoHosts: []`, the same message reports the empty list instead:
+
+```text
+Repository host "github.com" is not allowed. The allowlist is currently empty,
+which allows no repository at all. To allow it, add the host to the
+"gitops.allowedRepoHosts" Helm value (default: github.com, www.github.com) and
+restart the server.
+```
+
+A **scheme** problem is reported separately, because changing the chart value would not fix it:
+
+```text
+Repository URL scheme "ssh://" is not allowed. Use an https:// URL: it is the only
+scheme that can carry the server's git credential safely — http sends it in
+cleartext, and ssh/git URLs would pass it as an SSH username.
+```
+
+The scp-style shorthand gets its own wording — `Repository URLs must be written in full, not in the scp-style "host:path" shorthand`, followed by the same `https://` guidance.
+
+Adding a host takes effect on server restart (it is container configuration, so a Helm upgrade that changes the value rolls the pod).
+
+**Allowlisting a host does not enable automatic pull requests there.** Automatic PR creation still supports only GitHub remotes on `github.com`, in `<owner>/<repo>` form. Against any other host **you have allowlisted**, `pullRequest: true` clones, commits and pushes the branch as usual, and only then reports `pushed_without_pr` — you open the PR/MR manually. A host you have *not* allowlisted never reaches that point: the request is [refused](#when-a-push-is-refused) before anything is cloned or pushed, so no branch lands on the remote and the status is never `pushed_without_pr`. The same holds for a URL that is not `https://`, whatever host it names. See [Option: GitOps Pull Request](../tools/recommend.md#option-gitops-pull-request).
+
+**Upgrading from a release before this value existed?** Pushing to a GitLab, Bitbucket, or self-hosted remote stops working until you add its host. See [Upgrading: Pushing to a Non-GitHub Host Now Requires an Allowlist Entry](authorization.md#upgrading-pushing-to-a-non-github-host-now-requires-an-allowlist-entry).
 
 ## TLS Configuration
 

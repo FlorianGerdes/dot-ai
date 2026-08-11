@@ -27,7 +27,7 @@ fi
 
 # --- Get current version ---
 
-current_version=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname 2>/dev/null | head -1)
+current_version=$(git tag --list 'v*' --sort=-v:refname 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 if [ -z "$current_version" ]; then
   current_version="v0.0.0"
 fi
@@ -41,7 +41,7 @@ if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
 else
   echo "ERROR=true"
   echo "MESSAGE=Current tag '${current_version}' is not valid semver. Cannot determine version."
-  exit 0
+  exit 1
 fi
 
 # --- Analyze fragment types ---
@@ -49,34 +49,65 @@ fi
 has_breaking=false
 has_feature=false
 has_bugfix=false
+unknown_fragments=()
 
 for frag in "${fragments[@]}"; do
   case "$frag" in
     *.breaking.md) has_breaking=true ;;
     *.feature.md)  has_feature=true ;;
     *.bugfix.md)   has_bugfix=true ;;
+    *.doc.md|*.misc.md) ;; # known types that don't affect bump
+    *) unknown_fragments+=("$frag") ;;
   esac
 done
 
-# --- Calculate next version ---
+if [ ${#unknown_fragments[@]} -gt 0 ]; then
+  echo "ERROR=true"
+  echo "MESSAGE=Unknown fragment type(s): ${unknown_fragments[*]}"
+  exit 1
+fi
 
-if $has_breaking; then
-  bump_type="major"
-  proposed_version="v$(( major + 1 )).0.0"
-elif $has_feature; then
-  bump_type="minor"
-  proposed_version="v${major}.$(( minor + 1 )).0"
-elif $has_bugfix; then
-  bump_type="patch"
-  proposed_version="v${major}.${minor}.$(( patch + 1 ))"
+# --- Calculate next version ---
+#
+# The fragment-type -> bump mapping depends on whether we are pre-1.0:
+#
+#   While major is 0, the MINOR digit is the compatibility boundary
+#   (caret-rule semantics: 0.a.* and 0.b.* are incompatible for a != b).
+#   So a breaking/wire-incompatible change bumps the minor, while features
+#   and bugfixes ship as patch releases. The minor digit means "broke
+#   compatibility", not "has new features".
+#
+#   From 1.0 onward, use standard semver: breaking -> major,
+#   feature -> minor, bugfix -> patch.
+
+if [ "$major" -eq 0 ]; then
+  if $has_breaking; then
+    bump_type="minor"
+    proposed_version="v0.$(( minor + 1 )).0"
+  else
+    # feature, bugfix, or doc/misc-only: patch
+    bump_type="patch"
+    proposed_version="v0.${minor}.$(( patch + 1 ))"
+  fi
 else
-  bump_type="patch"
-  proposed_version="v${major}.${minor}.$(( patch + 1 ))"
+  if $has_breaking; then
+    bump_type="major"
+    proposed_version="v$(( major + 1 )).0.0"
+  elif $has_feature; then
+    bump_type="minor"
+    proposed_version="v${major}.$(( minor + 1 )).0"
+  elif $has_bugfix; then
+    bump_type="patch"
+    proposed_version="v${major}.${minor}.$(( patch + 1 ))"
+  else
+    bump_type="patch"
+    proposed_version="v${major}.${minor}.$(( patch + 1 ))"
+  fi
 fi
 
 # --- Check HEAD for skip-ci ---
 
-head_message=$(git log -1 --format="%s" HEAD 2>/dev/null || echo "")
+head_message=$(git log -1 --format="%B" HEAD 2>/dev/null || echo "")
 skip_ci=false
 if echo "$head_message" | grep -qiE '\[(skip ci|ci skip|no ci)\]'; then
   skip_ci=true

@@ -9,7 +9,7 @@ annotations: {}
 # Application image configuration
 image:
   repository: ghcr.io/vfarcic/dot-ai  # Container image repository
-  tag: "1.16.1"                     # Container image tag - set by CI pipeline during release
+  tag: "2.1.0"                     # Container image tag - set by CI pipeline during release
 
 # Resource configuration
 resources:
@@ -44,6 +44,9 @@ secrets:
   alibaba:
     keyName: alibaba-api-key        # Key name within the secret (PRD #382: Alibaba Qwen 3.5 Plus)
     apiKey: ""                      # API key value (only needed if chart should create the secret)
+  copilot:
+    keyName: copilot-token          # Key name within the secret (PRD #587: GitHub Copilot)
+    token: ""                       # GitHub OAuth/App token (gho_* or ghu_*) — from `gh auth token`
   customLlm:
     keyName: custom-llm-api-key     # Key name within the secret for custom LLM endpoint
     apiKey: ""                      # API key value (only needed if chart should create the secret)
@@ -52,6 +55,8 @@ secrets:
     apiKey: ""                      # API key value (only needed if chart should create the secret)
   # GitHub App authentication for git operations (PRD #362)
   # Note: PAT token uses DOT_AI_GIT_TOKEN env var configured via extraEnv
+  # Repository permissions the App needs: Contents: write, and Pull requests:
+  # write for pushToGit with pullRequest: true (PRD #710)
   githubApp:
     enabled: false                  # Enable GitHub App authentication
     appId: ""                       # GitHub App ID
@@ -150,7 +155,7 @@ gateway:
 
 # AI Provider configuration
 ai:
-  provider: anthropic               # AI provider type (anthropic, anthropic_opus, anthropic_haiku, openai, google, google_flash, host, kimi, xai, amazon_bedrock)
+  provider: anthropic               # AI provider type (anthropic, anthropic_opus, anthropic_haiku, openai, google, google_flash, host, kimi, xai, amazon_bedrock, alibaba, copilot, custom). Set to "" to auto-detect 'custom' from customEndpoint.
   model: ""                         # Optional: model override (e.g., "llama3.1:70b", "gpt-4o")
 
   # Custom endpoint configuration for self-hosted or alternative SaaS providers (PRD #194)
@@ -161,6 +166,19 @@ ai:
     embeddingsModel: ""             # Optional: custom embeddings model name (e.g., "nomic-embed-text" for Ollama, defaults to "text-embedding-3-small" for OpenAI)
     embeddingsDimensions: ""        # Optional: custom embeddings dimensions (e.g., "768" for nomic-embed-text, defaults to "1536" for OpenAI)
     headers: ""                     # Optional: custom HTTP headers as JSON string (PRD #443) (e.g., '{"version": "2026-02-20", "x-custom-auth": "token123"}')
+
+  # Retry tuning for AI SDK calls (PRD #459)
+  # Vercel AI SDK retries transient failures (HTTP 429/5xx, network errors) with
+  # exponential backoff. dot-ai sets a different maxRetries per operation so you
+  # can trade resilience against responsiveness. Leave a value empty to use the
+  # built-in default for that operation; set to "0" to disable retries.
+  # Per-operation values take precedence over the global default.
+  retries:
+    default: ""                     # Global override (DOT_AI_AI_MAX_RETRIES). Empty = use per-operation defaults below.
+    embeddings: ""                  # Embeddings, single + batch (DOT_AI_AI_MAX_RETRIES_EMBEDDINGS). Built-in default: 4
+    chat: ""                        # Single-turn generateText (DOT_AI_AI_MAX_RETRIES_CHAT). Built-in default: 2
+    toolLoop: ""                    # Agentic multi-step tool loop (DOT_AI_AI_MAX_RETRIES_TOOL_LOOP). Built-in default: 2
+    wrapUp: ""                      # Final summary after a tool loop (DOT_AI_AI_MAX_RETRIES_WRAP_UP). Built-in default: 1
 
   # Examples (commented out):
   # Example 1: Ollama (self-hosted) - IMPORTANT: Include /v1 suffix
@@ -187,10 +205,29 @@ ai:
   #     enabled: true
   #     baseURL: "http://vllm-service:8000/v1"  # /v1 suffix is REQUIRED
   #
+  # Example 4: Generic OpenAI-compatible endpoint via the 'custom' provider (Issue #474)
+  # Use this when you want to be explicit that the endpoint is not OpenAI itself.
+  # ai:
+  #   provider: custom
+  #   model: "your-model-name"
+  #   customEndpoint:
+  #     enabled: true
+  #     baseURL: "https://your.custom.llm/v1"
+  # secrets:
+  #   customLlm:
+  #     apiKey: "your-api-key"
+  #
   # Note: OpenAI-compatible endpoints (Ollama, vLLM, LocalAI) REQUIRE the /v1 suffix.
   # Without it, API calls will fail with 404 Not Found errors.
   # Custom endpoints must support OpenAI-compatible API and models must
   # support 8K+ output tokens for reliable YAML generation.
+
+# MCP protocol behavior
+mcp:
+  # Progress notifications for long-running tool calls (PRD #705).
+  # Emitted only when the client opts in with `_meta.progressToken`.
+  progress:
+    heartbeatIntervalMs: ""          # Liveness heartbeat interval (DOT_AI_MCP_PROGRESS_INTERVAL_MS). Empty = built-in default: 20000
 
 # Web UI integration (PRD #317: Query Visualization)
 # When configured, query tool responses include a visualizationUrl that opens
@@ -200,12 +237,70 @@ webUI:
                                       # When set, query responses include visualizationUrl field
                                       # Format: {baseUrl}/v/{sessionId}
 
+# GitOps push (PRD #395, PRD #710)
+gitops:
+  # Repository hosts the server may hand its own Git credential to.
+  #
+  # This is a SECURITY control, not a convenience: the repository URL comes from
+  # the client, and the server embeds ITS OWN credential (DOT_AI_GIT_TOKEN or a
+  # GitHub App installation token) into whatever URL it is given. Without an
+  # allowlist, any caller allowed to run the recommend tool can name a host they
+  # control and have that credential delivered to it.
+  #
+  # - Entries are hostnames: exact, case-insensitive, no wildcards, no substring
+  #   matching. A ":port" suffix is accepted and ignored (the credential reaches
+  #   the host whichever port answers). "github.com" therefore does NOT cover
+  #   "www.github.com" — which is why the default below lists both. Any other
+  #   host your callers use must be named the same way, spelling by spelling.
+  # - The URL must also be https://. That is checked TOGETHER with the host, so
+  #   http://, ssh://, git:// and the scp-style "host:path" shorthand are outside
+  #   the allowlist even when the host is listed — an entry here does not buy the
+  #   credential back for them. Supply the HTTPS clone URL.
+  # - An EMPTY list ([]) denies every repository. It does NOT mean "allow
+  #   everything" — to allow a host, name it. Emptying the whole block
+  #   (`gitops:` with nothing under it) is deny-all too; deleting it, or
+  #   `gitops: {}`, keeps the default below.
+  #
+  # THREE callers are gated by this one value, with deliberately different
+  # consequences:
+  # - pushToGit (recommend), direct push and pullRequest: true alike — REFUSED
+  #   before anything is cloned, committed or pushed. So pushing to a
+  #   GitLab/Bitbucket/self-hosted remote requires adding its host here.
+  #   Automatic pull request creation still only supports github.com; elsewhere
+  #   the branch is pushed and the PR must be opened manually.
+  # - The per-request prompts override (?repo=) — DEGRADED, not refused: the
+  #   clone still happens, unauthenticated. Public prompt repos on any host keep
+  #   working; a private one needs the X-Dot-AI-Git-Token request header
+  #   instead. (A scheme that is neither http nor https is rejected as invalid
+  #   input with HTTP 400 before this gate is reached.)
+  # - The remediate tool's repository clone — DEGRADED the same way, but it has
+  #   NO per-request credential header, so adding the host here is the only
+  #   remedy. It is gated because the model chooses the URL from
+  #   client-influenced context, and it fails as git's own auth error rather
+  #   than naming the allowlist.
+  #
+  # DOT_AI_USER_PROMPTS_REPO is the operator's own URL and is NOT gated.
+  #
+  # The default names both GitHub spellings: matching is exact with no wildcards,
+  # and "www.github.com" is the same host in practice (it clones via redirect and
+  # gets pull requests like the bare form), so listing only "github.com" would
+  # refuse a real GitHub remote written the other way.
+  #
+  # Docs: https://devopstoolkit.ai/docs/ai-engine/setup/deployment#gitops-repository-host-allowlist
+  allowedRepoHosts:
+    - github.com
+    - www.github.com
+
 # Additional environment variables (optional)
 # Use this to add any custom environment variables to the MCP server
 # Example use cases: tracing configuration, custom integrations, Git authentication
 #
-# Git Authentication for pushToGit stage (PRD #395):
-# To enable GitOps workflows, configure one of the following:
+# Git Authentication for pushToGit stage (PRD #395, PRD #710):
+# To enable GitOps workflows, configure one of the following.
+# The same credential covers both push modes: committing to the target branch
+# directly, and (pullRequest: true) opening a pull request from a
+# server-generated branch. Pull request mode additionally needs permission to
+# open pull requests — see the permissions listed below.
 #
 # Option 1: Personal Access Token (PAT)
 # extraEnv:
@@ -223,10 +318,12 @@ webUI:
 # Option 2: GitHub App (recommended for production)
 # - Set secrets.githubApp.enabled: true
 # - Configure secrets.githubApp.appId and secrets.githubApp.privateKey
+# - Repository permissions: Contents: write (push commits)
+#                           Pull requests: write (open a PR with pullRequest: true)
 #
-# Required token scopes:
-# - repo (for private repositories)
-# - public_repo (for public repositories)
+# Required PAT scopes:
+# - repo (for private repositories — also covers opening pull requests)
+# - public_repo (for public repositories — also covers opening pull requests)
 #
 extraEnv: []
   # OpenTelemetry tracing:
@@ -248,7 +345,7 @@ qdrant:
   enabled: true                     # Deploy Qdrant as dependency (false = use external)
   image:
     repository: qdrant/qdrant       # Qdrant image repository
-    tag: v1.15.5                    # Qdrant image tag
+    tag: v1.18.0                    # Qdrant image tag
   external:
     url: ""                         # External Qdrant URL (required when enabled=false)
     apiKey: ""                      # External Qdrant API key (optional)
@@ -265,6 +362,16 @@ localEmbeddings:
     tag: "cpu-latest"
   model: "sentence-transformers/all-MiniLM-L6-v2"  # Embedding model (384 dimensions)
   dimensions: 384                   # Must match the model's output dimensions
+  # Opt-in workaround (default off). TEI's built-in downloader cannot fetch models
+  # stored on HuggingFace's Xet backend (fails with "Header content-range is
+  # missing"). When enabled, an initContainer prefetches the model with a Xet-aware
+  # huggingface_hub client into a shared volume, and TEI loads it locally with
+  # HF_HUB_OFFLINE=1 (never using its own downloader). Requires PyPI + HuggingFace
+  # reachable at pod startup and only supports public (non-gated) models — leave it
+  # off for air-gapped, gated/private, local-path, or custom pre-baked-image setups.
+  prefetch:
+    enabled: false
+    image: "python:3.12-slim"       # Xet-aware downloader (pip installs huggingface_hub[hf_xet])
   resources:
     requests:
       cpu: "250m"
@@ -343,7 +450,7 @@ plugins:
     enabled: true
     image:
       repository: ghcr.io/vfarcic/dot-ai-agentic-tools
-      tag: "1.16.1"
+      tag: "2.1.0"
     port: 8080
     # RBAC created automatically by chart (hardcoded for agentic-tools)
     env: []                         # Additional environment variables
@@ -361,7 +468,7 @@ plugins:
   #   enabled: true
   #   image:
   #     repository: myregistry/my-tools
-  #     tag: "1.16.1"
+  #     tag: "2.1.0"
   #   port: 8082
   #   serviceAccountName: "my-tools-sa"  # You create this SA with needed permissions
   #   env:
